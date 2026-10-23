@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "inkdsh desktop shell for DeepSeek Harness"
 authors = ["inkdsh contributors"]
 edition = "2021"
+license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

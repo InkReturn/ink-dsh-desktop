@@ -2,6 +2,7 @@
   "name": "inkdsh",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "inkdsh — a fast, multi-host desktop client for DeepSeek Harness",
   "type": "module",
   "packageManager": "pnpm@11.21.0",

@@ -122,3 +122,7 @@ inkdsh-desktop/
 - 不做前端资源预载、会话投影预载或 chat 插件替换。
 - 安装包使用 NSIS；默认不内置运行时，`pnpm build:offline` 才生成含 Node + DSH 的离线包。
 - 官方 UI 的模型调用依赖本机 DSH 凭据与账号额度；客户端只负责启动和承载页面。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 InkReturn
