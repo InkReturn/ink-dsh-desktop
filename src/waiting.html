@@ -146,7 +146,7 @@
       <div class="status-wrap">
         <div class="status" id="status" role="status" aria-live="polite">正在启动本地内核</div>
         <pre class="detail" id="detail" hidden></pre>
-        <button class="retry" id="retry" type="button" hidden>重新启动内核</button>
+        <button class="retry" id="retry" type="button" hidden>重试</button>
       </div>
     </main>
 
@@ -157,33 +157,125 @@
         const mark = document.getElementById("mark");
         const retry = document.getElementById("retry");
         let polling = true;
+        let runtimeInfo = [];
+        let runtimeReadyAt = 0;
 
-        // 以错误样式展示启动失败原因，并显示重试入口。
-        window.__inkdshShowError = (message) => {
+        // 装配阶段与来源的展示名；与 Rust 侧序列化值一一对应。
+        const STAGES = {
+          verify: "校验运行时",
+          extract: "解压运行时",
+          activate: "启用运行时",
+        };
+        const SOURCES = {
+          override: "DSH_BIN 覆盖",
+          local: "项目本地 DSH",
+          managed: "托管运行时",
+          bundled: "捆绑运行时",
+          global: "全局 DSH",
+        };
+
+        // 更新诊断行；空内容时隐藏，避免占位空白。
+        function setDetail(lines) {
+          const text = lines.filter(Boolean).join("\n");
+          detail.textContent = text;
+          detail.hidden = text.length === 0;
+        }
+
+        // 以错误样式展示失败原因，并显示重试入口。
+        function showFailure(message, reasons) {
           polling = false;
           status.textContent = message;
           status.className = "status is-error";
           mark.className = "mark error-mark";
-          detail.hidden = true;
+          setDetail(Array.isArray(reasons) ? reasons : [reasons]);
           retry.hidden = false;
+        }
+
+        // Rust 侧导航失败时仍复用同一入口；此时没有逐来源原因。
+        window.__inkdshShowError = (message) => {
+          showFailure(message, []);
         };
 
-        // 从 Rust 侧轮询 sidecar 状态，全部渲染仍由等待页自己掌控。
+        // 渲染首启运行时装配状态；返回 true 表示仍在装配或已失败。
+        function renderRuntime(runtime) {
+          if (!runtime) return false;
+          switch (runtime.phase) {
+            case "detect":
+              status.textContent = "正在检测本地内核";
+              status.className = "status";
+              setDetail([]);
+              return true;
+            case "installing":
+              status.textContent = "正在装配本地内核";
+              status.className = "status";
+              setDetail([
+                `阶段：${STAGES[runtime.stage] || runtime.stage}`,
+                runtime.detail,
+              ]);
+              return true;
+            case "ready":
+              status.textContent = "正在启动本地内核";
+              status.className = "status";
+              runtimeInfo = [
+                `来源：${SOURCES[runtime.source] || runtime.source}`,
+                runtime.version ? `版本：${runtime.version}` : "",
+              ];
+              runtimeReadyAt = runtimeReadyAt || Date.now();
+              setDetail(runtimeInfo);
+              return false;
+            case "failed": {
+              // 逐来源原因与修复建议都展示；有原因时不能丢弃 hint。
+              const lines = Array.isArray(runtime.reasons)
+                ? runtime.reasons.slice()
+                : [];
+              if (runtime.hint) lines.push(runtime.hint);
+              showFailure(
+                runtime.message || "本地内核装配失败",
+                lines.length ? lines : [runtime.hint].filter(Boolean),
+              );
+              return true;
+            }
+            default:
+              return false;
+          }
+        }
+
+        // 从 Rust 侧轮询 sidecar 与运行时状态，全部渲染仍由等待页自己掌控。
         async function pollSidecar() {
           if (!polling) return;
           const invoke = window.__TAURI__?.core?.invoke;
           if (invoke) {
             try {
-              const snapshot = await invoke("sidecar_status");
+              const [snapshot, runtime] = await Promise.all([
+                invoke("sidecar_status"),
+                invoke("runtime_status"),
+              ]);
+
+              // 装配失败优先展示逐来源原因；装配就绪后继续看 sidecar 状态。
+              const assembling = renderRuntime(runtime);
+              if (
+                !assembling &&
+                snapshot.state === "starting" &&
+                runtimeReadyAt > 0 &&
+                Date.now() - runtimeReadyAt > 20000
+              ) {
+                // 空 DSH_HOME 首次启动需要初始化 profile；给出可预期的等待说明。
+                setDetail([
+                  ...runtimeInfo,
+                  "首次启动需要初始化用户目录，可能需要几分钟，请稍候",
+                ]);
+              }
+
               if (snapshot.state === "ready") {
                 status.textContent = "正在打开工作区";
                 status.className = "status is-ready";
                 setTimeout(pollSidecar, 600);
                 return;
               }
-              if (snapshot.state === "failed" || snapshot.state === "stopped") {
-                window.__inkdshShowError(
-                  snapshot.message || "本地内核已停止，请重新启动 inkdsh",
+              if (!assembling && (snapshot.state === "failed" || snapshot.state === "stopped")) {
+                showFailure(
+                  snapshot.message || "本地内核已停止，请重试",
+                  snapshot.log_tail,
                 );
                 return;
               }
@@ -194,21 +286,23 @@
           setTimeout(pollSidecar, 700);
         }
 
-        // 用户点击重试后复位状态，由 Rust 重新走完整的 sidecar 启动流程。
+        // 用户点击重试后复位状态，由 Rust 重新走完整的装配与启动流程。
         retry.addEventListener("click", async () => {
           const invoke = window.__TAURI__?.core?.invoke;
           if (!invoke) return;
           polling = true;
           retry.hidden = true;
-          detail.hidden = true;
+          runtimeInfo = [];
+          runtimeReadyAt = 0;
+          setDetail([]);
           status.className = "status";
           mark.className = "mark";
-          status.textContent = "正在重新启动本地内核";
+          status.textContent = "正在重新检测本地内核";
           try {
             await invoke("sidecar_retry");
             setTimeout(pollSidecar, 600);
           } catch (error) {
-            window.__inkdshShowError(`重试失败：${String(error)}`);
+            showFailure(`重试失败：${String(error)}`, []);
           }
         });
 

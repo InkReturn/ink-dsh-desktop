@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "engines": {
+    "dsh": {
+      "minimum": "0.2.0"
+    }
+  },
+  "core": {
+    "version": null,
+    "url": null,
+    "sha256": null,
+    "sizeBytes": null,
+    "fileName": null
+  }
+}

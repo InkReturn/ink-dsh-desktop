@@ -15,6 +15,9 @@ tauri-plugin-single-instance = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 portpicker = "0.1"
 dunce = "1"
 
@@ -24,4 +27,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_System_JobObjects",
   "Win32_System_Threading",
+  "Win32_UI_Shell",
 ] }
+webview2-com = "0.39"
+windows-core = "0.62"

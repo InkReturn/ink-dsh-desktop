@@ -11,9 +11,27 @@
     "build": "tauri build",
     "build:offline": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stage-runtime.ps1 -Force && tauri build",
     "runtime:stage": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stage-runtime.ps1",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "plugins:typecheck": "pnpm -r --filter \"./plugins/*\" typecheck",
+    "plugins:test": "pnpm -r --filter \"./plugins/*\" test"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.12.4"
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-store": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-chat": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session-projection": "0.2.1-rc.2",
+    "@tanstack/react-virtual": "3.14.10",
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
   }
 }

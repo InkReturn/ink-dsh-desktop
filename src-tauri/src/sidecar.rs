@@ -1,7 +1,8 @@
 //! DSH sidecar 的发现、启动、状态查询与进程树回收。
 //!
-//! 本模块只负责 Phase 1 的本地 `dsh web` 进程：定位 DSH 入口、选择回环端口、
-//! 捕获输出、解析官方就绪地址，并保证应用退出时回收整个子进程树。
+//! 本模块负责运行时的最终选择与本地 `dsh web` 进程：先由 `runtime` 模块
+//! 解析来源、校验版本并按需装配托管运行时，再选择回环端口、捕获输出、解析
+//! 官方就绪地址，并保证应用退出时回收整个子进程树。
 
 use std::{
     collections::VecDeque,
@@ -22,14 +23,20 @@ use std::{
 use serde::Serialize;
 use tauri::State;
 
-/// DSH npm 包内 CLI 入口的相对路径，相对于安装根目录。
-const DSH_PACKAGE_BIN: &str = "node_modules/@deepseek-ai/dsh/lib/bin.js";
+use crate::runtime::{
+    manifest::ENV_MANIFEST, BootstrapState, CoreCandidate, CoreSource, InstallStage,
+    LoadedManifest, RejectedCandidate, Resolution, RuntimeEnvironment, RuntimeStatus,
+};
 
 /// 官方 `dsh web` 输出就绪地址时使用的前缀。
 const READY_PREFIX: &str = "dsh web: ";
 
-/// sidecar 首轮启动等待上限；官方冷启动在低配机器上也需要较长时间。
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// sidecar 首轮启动等待上限。
+///
+/// 空 `DSH_HOME` 首次启动时，DSH 需要初始化 profile、凭证占位与工作区记录；
+/// 本机实测冷启动约 4 分钟（受杀毒扫描与网络探测影响），因此上限放宽到
+/// 5 分钟。已有 profile 的后续启动通常在数秒内就绪。
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 内存日志最多保留的行数，避免长期运行持续占用内存。
 const LOG_LIMIT: usize = 80;
@@ -95,8 +102,54 @@ struct LaunchSpec {
     node: PathBuf,
     /// DSH 的 `lib/bin.js` 入口。
     bin: PathBuf,
-    /// 运行时来源，仅用于日志与诊断。
-    source: &'static str,
+    /// 运行时来源，用于日志与诊断。
+    source: CoreSource,
+    /// 归一化后的 DSH 版本，用于启动日志。
+    version: Option<String>,
+}
+
+impl LaunchSpec {
+    /// 把来源解析结果转换为启动规格。
+    ///
+    /// 参数：
+    /// - `candidate`：`runtime` 模块选中的候选，已通过版本校验。
+    ///
+    /// 返回值：可直接交给 [`build_sidecar_command`] 的启动参数。
+    fn from_candidate(candidate: &CoreCandidate) -> Self {
+        // 1. 只搬运启动必需字段，避免后面误用候选的文件系统信息。
+        Self {
+            node: candidate.node.clone(),
+            bin: candidate.bin.clone(),
+            source: candidate.source,
+            version: candidate.version.as_ref().map(ToString::to_string),
+        }
+    }
+
+    /// 生成日志中的来源描述。
+    ///
+    /// 返回值：`来源（版本）`，版本未知时只写来源。
+    fn describe(&self) -> String {
+        // 1. 优先写规范化版本，保持与清单一致的写法。
+        match &self.version {
+            Some(version) => format!("{}（{version}）", self.source.label()),
+            None => self.source.label().to_string(),
+        }
+    }
+}
+
+/// sidecar 需要的一组应用路径。
+#[derive(Debug, Clone)]
+pub struct SidecarPaths {
+    /// sidecar 诊断日志文件。
+    pub log: PathBuf,
+    /// 崩溃后用于清扫孤儿的 PID/端口标记。
+    pub pid_marker: PathBuf,
+    /// 应用数据目录；托管运行时固定在其下。
+    pub data_dir: PathBuf,
+    /// Tauri 安装资源根；用于定位捆绑运行时与清单。
+    pub resource_dir: Option<PathBuf>,
+    /// 编译期 `src-tauri` 目录；仅开发构建用于定位仓库内清单/运行时。
+    pub crate_dir: Option<PathBuf>,
 }
 
 /// sidecar 的可变运行状态。
@@ -115,6 +168,8 @@ struct RuntimeState {
 pub struct SidecarManager {
     /// 生命周期状态与日志的同步保护。
     inner: Mutex<RuntimeState>,
+    /// 首启装配状态机快照。
+    bootstrap: Mutex<BootstrapState>,
     /// 防止并发或重复启动。
     started: AtomicBool,
     /// 应用正在退出时阻止迟到的 spawn 留下孤儿进程。
@@ -125,8 +180,14 @@ pub struct SidecarManager {
     pid_path: PathBuf,
     /// 管理器创建时间，用于日志中的相对时间戳。
     clock: Instant,
-    /// 可选离线运行时根目录；存在 `node/` 与 `dsh/` 时优先使用。
-    bundled_runtime_root: Option<PathBuf>,
+    /// 应用数据目录；托管运行时根目录由它派生。
+    data_dir: PathBuf,
+    /// 安装资源根；用于定位捆绑运行时与清单。
+    resource_dir: Option<PathBuf>,
+    /// 编译期源码目录；仅开发构建用于回退查找仓库内资源。
+    crate_dir: Option<PathBuf>,
+    /// 本次选中 DSH 的包目录；P2.3 据此定位 `dsh-web-frontend`。
+    selected_package_dir: Mutex<Option<PathBuf>>,
     /// Windows Job Object：应用进程崩溃时由系统杀死整棵 sidecar 进程树。
     #[cfg(windows)]
     process_job: Mutex<Option<ProcessJob>>,
@@ -136,28 +197,31 @@ impl SidecarManager {
     /// 创建一个尚未启动的管理器。
     ///
     /// 参数：
-    /// - `log_path`：sidecar 日志文件路径；父目录不存在时会尝试创建。
-    /// - `pid_path`：PID/端口标记文件路径，用于应用崩溃后的启动清扫。
-    /// - `bundled_runtime_root`：可选离线运行时根目录；传入不存在的路径
-    ///   时自动回退本地/全局 DSH。
+    /// - `paths`：日志、PID 标记、应用数据、安装资源与源码目录的集合；
+    ///   托管运行时由 `data_dir` 派生，测试可整体指向临时目录。
     ///
     /// 返回值初始状态为 `Starting`，但不会拉起任何进程；真正的启动由
     /// [`SidecarManager::start`] 完成。
-    pub fn new(
-        log_path: PathBuf,
-        pid_path: PathBuf,
-        bundled_runtime_root: Option<PathBuf>,
-    ) -> Self {
-        // 1. 尽量创建日志和标记的父目录，失败留给首次写入时报错并记录。
-        // 2. 日志超过大小上限时轮转一次，避免长期运行无限增长。
-        // 3. 初始化空状态与两个原子标记。
-        if let Some(parent) = log_path.parent() {
+    pub fn new(paths: SidecarPaths) -> Self {
+        // 1. 先拆出需要长期保存的路径，避免结构体字段遗漏。
+        let SidecarPaths {
+            log,
+            pid_marker,
+            data_dir,
+            resource_dir,
+            crate_dir,
+        } = paths;
+
+        // 2. 尽量创建日志和标记的父目录，失败留给首次写入时报错并记录。
+        // 3. 日志超过大小上限时轮转一次，避免长期运行无限增长。
+        // 4. 初始化空状态、装配状态机与两个原子标记。
+        if let Some(parent) = log.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Some(parent) = pid_path.parent() {
+        if let Some(parent) = pid_marker.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        rotate_log_if_needed(&log_path);
+        rotate_log_if_needed(&log);
         Self {
             inner: Mutex::new(RuntimeState {
                 status: SidecarStatus::Starting,
@@ -165,12 +229,16 @@ impl SidecarManager {
                 pid: None,
                 logs: VecDeque::new(),
             }),
+            bootstrap: Mutex::new(BootstrapState::default()),
             started: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
-            log_path,
-            pid_path,
+            log_path: log,
+            pid_path: pid_marker,
             clock: Instant::now(),
-            bundled_runtime_root,
+            data_dir,
+            resource_dir,
+            crate_dir,
+            selected_package_dir: Mutex::new(None),
             #[cfg(windows)]
             process_job: Mutex::new(None),
         }
@@ -201,15 +269,26 @@ impl SidecarManager {
         }
         self.set_starting();
 
-        // 3. 先清扫上次崩溃留下的 sidecar，再定位当前可用的 DSH 入口。
+        // 3. 先清扫上次崩溃留下的 sidecar，再按来源优先级解析运行时；
+        //    托管运行时缺失且清单可安装时，会在这一步完成装配。
         self.sweep_orphan();
-        let launch = match resolve_launch_spec(self.bundled_runtime_root.as_deref()) {
-            Ok(spec) => spec,
+        let candidate = match self.resolve_runtime() {
+            Ok(candidate) => candidate,
             Err(message) => {
                 self.fail_startup(message.clone());
                 return Err(message);
             }
         };
+        let launch = LaunchSpec::from_candidate(&candidate);
+        self.set_selected_package_dir(candidate.package_dir.clone());
+
+        // 3.1 装配期间用户可能已关闭窗口；此时不再 spawn，避免退出前留下进程。
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            return Err("应用正在退出，已取消启动 DSH sidecar".to_string());
+        }
+
+        // 4. 记录 DSH_HOME 继承情况（只读，不创建目录），并选择回环端口。
+        self.record_dsh_home();
         let port = match portpicker::pick_unused_port() {
             Some(port) => port,
             None => {
@@ -222,13 +301,13 @@ impl SidecarManager {
             "lifecycle",
             &format!(
                 "准备启动 DSH（{}）：node={}，bin={}，端口 {port}",
-                launch.source,
+                launch.describe(),
                 launch.node.display(),
                 launch.bin.display()
             ),
         );
 
-        // 4. 通过 node 启动 `dsh web`，并注入稳定的无颜色、无遥测环境。
+        // 5. 通过 node 启动 `dsh web`，并注入稳定的无颜色、无遥测环境。
         let mut command = build_sidecar_command(&launch, port);
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -239,7 +318,7 @@ impl SidecarManager {
             }
         };
 
-        // 5. 立即登记 PID 和标记；即使应用在就绪前退出，也能按 PID 回收进程树。
+        // 6. 立即登记 PID 和标记；即使应用在就绪前退出，也能按 PID 回收进程树。
         let pid = child.id();
         self.set_pid(pid);
         #[cfg(windows)]
@@ -263,7 +342,7 @@ impl SidecarManager {
             &format!("DSH sidecar 已启动：pid={pid}，等待就绪地址"),
         );
 
-        // 6. 取出输出管道；任何一步失败都要先杀掉已启动的进程。
+        // 7. 取出输出管道；任何一步失败都要先杀掉已启动的进程。
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -281,7 +360,7 @@ impl SidecarManager {
             }
         };
 
-        // 7. 启动独立读取线程，避免 stdout/stderr 任一管道写满导致子进程阻塞。
+        // 8. 启动独立读取线程，避免 stdout/stderr 任一管道写满导致子进程阻塞。
         let (startup_tx, startup_rx) = mpsc::channel();
         if let Err(error) =
             spawn_output_reader(Arc::clone(self), stdout, "stdout", Some(startup_tx.clone()))
@@ -301,7 +380,7 @@ impl SidecarManager {
             return Err(message);
         }
 
-        // 8. 等待官方就绪行；成功后再次确认应用未退出，再发布 Ready 状态。
+        // 9. 等待官方就绪行；成功后再次确认应用未退出，再发布 Ready 状态。
         match self.await_ready(startup_rx, port) {
             Ok(url) => match self.mark_ready(port, pid, url.clone()) {
                 Ok(()) => Ok(url),
@@ -399,7 +478,285 @@ impl SidecarManager {
         inner.url = None;
         inner.pid = None;
         inner.logs.clear();
+        drop(inner);
+
+        // 4. 装配状态回到探测，让等待页在重试时立即看到新一轮进度。
+        self.bootstrap
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .detect();
         Ok(())
+    }
+
+    /// 读取首启装配状态快照。
+    ///
+    /// 返回值：`detect` / `installing` / `ready` / `failed` 之一，供等待页
+    /// 展示装配阶段、错误与重试入口。
+    pub fn runtime_snapshot(&self) -> RuntimeStatus {
+        // 1. 锁只覆盖克隆，避免把内部锁暴露给调用方。
+        self.bootstrap
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .status()
+    }
+
+    /// 记录本次选中的 DSH 包目录。
+    ///
+    /// 参数：
+    /// - `path`：`@deepseek-ai/dsh` 包根目录，供 P2.3 定位前端 dist。
+    fn set_selected_package_dir(&self, path: PathBuf) {
+        // 1. 只保存路径，不读取或写入包内容。
+        *self
+            .selected_package_dir
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(path);
+    }
+
+    /// 返回本次选中的 DSH 包目录。
+    ///
+    /// 返回值：sidecar 尚未解析来源时为 `None`。
+    pub fn selected_package_dir(&self) -> Option<PathBuf> {
+        // 1. 克隆路径，避免调用方长期持有锁。
+        self.selected_package_dir
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// 写一行预载日志到 sidecar 日志，便于与启动流程一起排查。
+    ///
+    /// 参数：
+    /// - `line`：已脱敏的预载诊断文本。
+    pub fn log_preload(&self, line: &str) {
+        // 1. 复用统一的日志脱敏与落盘逻辑。
+        self.record_log("preload", line);
+    }
+
+    /// 解析来源，并在需要时装配托管运行时。
+    ///
+    /// 返回值：通过版本校验、可直接启动的候选；全部来源失败时返回用户可见
+    /// 的错误摘要，同时把逐来源原因写入装配状态与日志。
+    ///
+    /// 副作用：读取清单与文件系统；托管安装时写 staging、替换 AppData 下的
+    /// `runtime/`；不会写用户 `DSH_HOME`。
+    fn resolve_runtime(&self) -> Result<CoreCandidate, String> {
+        // 1. 加载运行时清单并记录诊断（清单缺失不阻断，只关闭最低版本校验）。
+        //    显式路径仅调试构建可用，防止发布包被环境变量改写最低版本基线。
+        let explicit_manifest = if cfg!(debug_assertions) {
+            env::var_os(ENV_MANIFEST).map(PathBuf::from)
+        } else {
+            None
+        };
+        let manifest = LoadedManifest::load(
+            explicit_manifest.as_deref(),
+            self.resource_dir.as_deref(),
+            self.crate_dir.as_deref(),
+        );
+        for line in &manifest.diagnostics {
+            self.record_log("runtime", line);
+        }
+        self.record_log("runtime", &manifest.summary());
+
+        // 2. 构造来源环境，并先处理上次崩溃留下的中断切换。
+        let environment = RuntimeEnvironment::discover(
+            &self.data_dir,
+            self.resource_dir.as_deref(),
+            self.crate_dir.as_deref(),
+            &manifest,
+        );
+        for line in &environment.diagnostics {
+            self.record_log("runtime", line);
+        }
+        if let Some(message) = environment.managed.recover_interrupted_activation() {
+            self.record_log("runtime", &message);
+        }
+
+        // 3. 解析 → 必要时装配 → 装配失败后继续回退，直到成功或全部失败。
+        let mut resolution = environment.resolve();
+        let mut install_error: Option<String> = None;
+        loop {
+            match resolution {
+                Resolution::Use {
+                    candidate,
+                    rejected: prior,
+                    diagnostics,
+                } => {
+                    self.log_resolution(&prior, &diagnostics);
+                    self.record_log(
+                        "runtime",
+                        &format!(
+                            "运行时来源确定：{}，版本 {}，node={}，bin={}",
+                            candidate.source.label(),
+                            candidate.version_label(),
+                            candidate.node.display(),
+                            candidate.bin.display()
+                        ),
+                    );
+                    self.set_runtime_ready(
+                        candidate.source,
+                        candidate.version.as_ref().map(ToString::to_string),
+                    );
+                    return Ok(candidate);
+                }
+                Resolution::InstallManaged {
+                    artifact,
+                    rejected: prior,
+                    diagnostics,
+                } => {
+                    self.log_resolution(&prior, &diagnostics);
+                    let mut rejected = prior;
+                    self.record_log("runtime", "开始装配托管运行时（Managed）");
+                    self.record_log(
+                        "runtime",
+                        &format!("托管运行时目录：{}", environment.managed.root().display()),
+                    );
+                    self.set_runtime_stage(InstallStage::Verify, "准备装配运行时".to_string());
+
+                    // 3.1 安装器的阶段回调同时更新状态机与日志，等待页因此能
+                    //     看到「校验 → 解压 → 启用」。
+                    let mut progress = |stage: InstallStage, detail: String| {
+                        self.set_runtime_stage(stage, detail.clone());
+                        self.record_log("runtime", &format!("[{}] {detail}", stage.label()));
+                    };
+                    match environment.managed.install(
+                        &artifact,
+                        environment.minimum.as_ref(),
+                        &mut progress,
+                    ) {
+                        Ok(candidate) => {
+                            self.record_log(
+                                "runtime",
+                                &format!(
+                                    "托管运行时装配完成：版本 {}，node={}，bin={}",
+                                    candidate.version_label(),
+                                    candidate.node.display(),
+                                    candidate.bin.display()
+                                ),
+                            );
+                            self.set_runtime_ready(
+                                candidate.source,
+                                candidate.version.as_ref().map(ToString::to_string),
+                            );
+                            return Ok(candidate);
+                        }
+                        Err(error) => {
+                            // 3.2 装配失败只记录并回退到更低优先级来源；全部
+                            //     失败时才把该错误作为用户可见摘要。
+                            let detail = error.detail();
+                            self.record_log(
+                                "runtime",
+                                &format!("托管运行时装配失败（{}）：{detail}", error.code()),
+                            );
+                            rejected.push(RejectedCandidate {
+                                source: CoreSource::Managed,
+                                detail: format!("{}: {detail}", error.code()),
+                            });
+                            install_error = Some(error.user_message());
+                            resolution =
+                                environment.resolve_after_managed_failure(rejected.clone());
+                        }
+                    }
+                }
+                Resolution::Unavailable {
+                    reasons,
+                    diagnostics,
+                } => {
+                    // 4. 全部来源不可用：逐条落日志，并把原因交给等待页。
+                    for line in &diagnostics {
+                        self.record_log("runtime", line);
+                    }
+                    for reason in &reasons {
+                        self.record_log("runtime", &format!("来源不可用：{reason}"));
+                    }
+                    let message = install_error
+                        .clone()
+                        .or_else(|| {
+                            // 单一硬失败（例如 DSH_BIN 无效）直接把具体原因作为标题。
+                            (reasons.len() == 1).then(|| reasons[0].clone())
+                        })
+                        .unwrap_or_else(|| "未找到可用的 DSH 运行时".to_string());
+                    self.set_runtime_failed(
+                        message.clone(),
+                        "点击重试可重新装配；也可查看日志中的逐来源原因".to_string(),
+                        reasons,
+                    );
+                    return Err(message);
+                }
+            }
+        }
+    }
+
+    /// 记录一轮解析中的回退与诊断。
+    ///
+    /// 参数：
+    /// - `rejected`：优先级更高但被拒绝的候选。
+    /// - `diagnostics`：解析器附加的环境诊断。
+    fn log_resolution(&self, rejected: &[RejectedCandidate], diagnostics: &[String]) {
+        // 1. 先写环境诊断，再写逐来源回退，保持时间顺序可读。
+        for line in diagnostics {
+            self.record_log("runtime", line);
+        }
+        for item in rejected {
+            self.record_log("runtime", &format!("来源回退：{}", item.describe()));
+        }
+    }
+
+    /// 记录子进程将继承的 DSH_HOME 来源（只读，不创建目录）。
+    ///
+    /// 副作用：只写日志。生产环境不设置也不改动 `DSH_HOME`，用户数据目录
+    /// 仍由 DSH 自身决定；测试通过外部环境变量注入隔离目录。
+    fn record_dsh_home(&self) {
+        // 1. 有显式环境变量时记录路径；没有时说明会使用 DSH 默认目录。
+        match env::var_os("DSH_HOME") {
+            Some(value) => self.record_log(
+                "runtime",
+                &format!(
+                    "DSH_HOME 由环境变量指定：{}",
+                    PathBuf::from(value).display()
+                ),
+            ),
+            None => self.record_log("runtime", "DSH_HOME 未设置，子进程使用 DSH 默认用户目录"),
+        }
+    }
+
+    /// 更新装配阶段状态。
+    ///
+    /// 参数：
+    /// - `stage`：当前阶段。
+    /// - `detail`：阶段细节，供等待页展示。
+    fn set_runtime_stage(&self, stage: InstallStage, detail: String) {
+        // 1. 状态机只允许在探测/装配阶段更新，其它阶段保持现状。
+        self.bootstrap
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .begin_install(CoreSource::Managed, stage, detail);
+    }
+
+    /// 把装配状态置为就绪。
+    ///
+    /// 参数：
+    /// - `source`：最终选中的来源。
+    /// - `version`：DSH 版本；读取失败时为 `None`。
+    fn set_runtime_ready(&self, source: CoreSource, version: Option<String>) {
+        // 1. 就绪后等待页改为等待 sidecar 状态，不再显示装配进度。
+        self.bootstrap
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ready(source, version);
+    }
+
+    /// 把装配状态置为失败。
+    ///
+    /// 参数：
+    /// - `message`：用户可见的一句话。
+    /// - `hint`：修复建议。
+    /// - `reasons`：逐来源原因。
+    fn set_runtime_failed(&self, message: String, hint: String, reasons: Vec<String>) {
+        // 1. 失败状态允许重试；重试入口由 sidecar_retry 触发。
+        self.bootstrap
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .fail(message, Some(hint), reasons);
     }
 
     /// 把状态重置为 Starting 并清空上一轮运行数据。
@@ -774,200 +1131,16 @@ pub fn sidecar_url(state: State<'_, Arc<SidecarManager>>) -> Option<String> {
     state.url()
 }
 
-/// 解析本次 sidecar 应使用的 Node 与 DSH 入口。
-///
-/// 优先级：
-/// 1. 环境变量 `DSH_BIN`（开发调试显式覆盖）；
-/// 2. 可选离线运行时目录（`node/` + `dsh/lib/bin.js`）；
-/// 3. 项目本地 `node_modules`；
-/// 4. PATH 中 `dsh` shim 对应的全局 npm/pnpm 安装。
+/// 查询首启运行时装配状态。
 ///
 /// 参数：
-/// - `bundled_root`：Tauri 资源目录下可选的 `runtime/`；不存在时回退。
+/// - `state`：Tauri 注入的管理器状态；应用启动时已注册，不会为空。
 ///
-/// 返回值：可直接用于构造 Command 的 [`LaunchSpec`]；全部缺失时返回带
-/// 修复指引的错误。该函数只读文件系统，不启动进程。
-fn resolve_launch_spec(bundled_root: Option<&Path>) -> Result<LaunchSpec, String> {
-    // 1. 显式 DSH_BIN 覆盖优先；设置错误时硬失败，避免悄悄换版本。
-    if let Some(raw) = env::var_os("DSH_BIN") {
-        let bin = PathBuf::from(raw);
-        if !bin.is_file() {
-            return Err(format!("DSH_BIN 指向的文件不存在：{}", bin.display()));
-        }
-        return Ok(LaunchSpec {
-            node: node_from_env_or_path(),
-            bin: normalize_existing_path(&bin),
-            source: "DSH_BIN 覆盖",
-        });
-    }
-
-    // 2. 可选离线运行时优先级高于系统安装，保证离线安装结果可复现。
-    if let Some(spec) = bundled_root.and_then(bundled_launch_spec) {
-        return Ok(spec);
-    }
-
-    // 3. 再查本地依赖与全局安装，均复用系统 Node。
-    if let Some((bin, source)) = locate_installed_dsh_bin() {
-        return Ok(LaunchSpec {
-            node: node_from_env_or_path(),
-            bin,
-            source,
-        });
-    }
-
-    Err("未找到 DSH。请安装带可选离线运行时的 inkdsh，或执行 \
-         `pnpm install` / `npm i -g @deepseek-ai/dsh`；开发时也可以设置 \
-         DSH_BIN 指向 node_modules/@deepseek-ai/dsh/lib/bin.js。"
-        .to_string())
-}
-
-/// 检查可选离线运行时目录并生成启动规格。
-///
-/// 参数：
-/// - `root`：运行时根目录，约定包含 `node/` 与 `dsh/lib/bin.js`。
-///
-/// 返回值：Node 与 DSH 都存在时返回捆绑来源；任一缺失返回 `None`，由上层
-/// 继续尝试系统安装。该函数不读取版本清单，也不执行任何文件。
-fn bundled_launch_spec(root: &Path) -> Option<LaunchSpec> {
-    // 1. 按平台选择 Node 文件名并校验 DSH 入口存在。
-    // 2. Tauri 资源路径在 Windows 上可能是 `\\?\D:\...` verbatim 形式；
-    //    Node 会把这种入口参数误解析为盘符 `D:`，必须先去掉 verbatim 前缀。
-    // 3. 两者齐全才视为可用捆绑运行时。
-    let node = root
-        .join("node")
-        .join(if cfg!(windows) { "node.exe" } else { "node" });
-    let bin = root.join("dsh").join("lib").join("bin.js");
-    if !node.is_file() || !bin.is_file() {
-        return None;
-    }
-    Some(LaunchSpec {
-        node: normalize_existing_path(&node),
-        bin: normalize_existing_path(&bin),
-        source: "捆绑运行时",
-    })
-}
-
-/// 把已存在的路径归一化为不带 Windows verbatim 前缀的绝对路径。
-///
-/// 参数：
-/// - `path`：必须已存在的文件或目录路径。
-///
-/// 返回值：`dunce::canonicalize` 成功时返回归一化路径；失败时保留原始路径，
-/// 由后续启动错误给出更具体的提示。Windows 上去掉 `\\?\` 前缀，避免
-/// node.exe 将脚本参数误解析为盘符。
-fn normalize_existing_path(path: &Path) -> PathBuf {
-    // 1. 使用 dunce 兼容 UNC 与超长路径，同时去掉 Node 不接受的 verbatim 前缀。
-    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// 在项目本地和全局安装中查找 DSH 入口。
-///
-/// 返回值：`(bin.js 路径, 来源标签)`；未找到返回 `None`。来源标签用于日志，
-/// 不参与启动决策。
-fn locate_installed_dsh_bin() -> Option<(PathBuf, &'static str)> {
-    // 1. 先查本地依赖，pnpm install 后应命中项目内的固定版本。
-    for root in local_install_roots() {
-        let candidate = root.join(DSH_PACKAGE_BIN);
-        if candidate.is_file() {
-            return Some((candidate, "项目本地 DSH"));
-        }
-    }
-
-    // 2. 再查全局安装；PATH shim 目录与 Unix prefix/lib 都会覆盖。
-    for root in global_install_roots() {
-        for candidate in global_package_candidates(&root) {
-            if candidate.is_file() {
-                return Some((candidate, "全局 DSH"));
-            }
-        }
-    }
-
-    None
-}
-
-/// 读取显式 Node 覆盖，否则交给 PATH 解析 `node`。
-///
-/// 返回值：`DSH_NODE` 非空时返回其路径；否则返回 `node`。`DSH_NODE` 是开发
-/// 调试用的显式覆盖，不参与捆绑运行时选择。
-fn node_from_env_or_path() -> PathBuf {
-    // 1. 空值等价于未设置，避免命令行传空串导致 spawn 失败。
-    env::var_os("DSH_NODE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|path| normalize_existing_path(&path))
-        .unwrap_or_else(|| PathBuf::from("node"))
-}
-
-/// 收集可能包含本地 DSH 依赖的安装根目录。
-///
-/// 返回值按优先级排序：当前工作目录的 3 级祖先，然后是 Cargo 项目根。
-/// 目录可能重复，调用方只按顺序做存在性探测，因此无需额外去重。
-fn local_install_roots() -> Vec<PathBuf> {
-    // 1. 加入运行目录及其有限祖先，兼容从仓库根或子目录启动。
-    // 2. 加入编译期识别的仓库根，兼容开发时工作目录被 IDE 改写。
-    let mut roots = Vec::new();
-    if let Ok(current_dir) = env::current_dir() {
-        roots.extend(current_dir.ancestors().take(3).map(Path::to_path_buf));
-    }
-    if let Some(project_root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
-        roots.push(project_root.to_path_buf());
-    }
-    roots
-}
-
-/// 收集全局 DSH 可能的安装根目录。
-///
-/// 返回值包括 PATH 中实际存在 `dsh` shim 的目录，以及 npm 的常见全局 prefix。
-/// 该函数只生成候选，不保证 DSH 包真的存在。
-fn global_install_roots() -> Vec<PathBuf> {
-    // 1. 扫描 PATH，只有看到 dsh shim 的目录才加入候选，避免无关目录误判。
-    // 2. 补充 npm 在 Windows/Unix 上的默认全局目录。
-    let mut roots = Vec::new();
-    if let Some(path) = env::var_os("PATH") {
-        for directory in env::split_paths(&path) {
-            let has_shim = ["dsh", "dsh.exe", "dsh.cmd", "dsh.ps1", "dsh.bat"]
-                .iter()
-                .any(|name| directory.join(name).is_file());
-            if has_shim {
-                roots.push(directory);
-            }
-        }
-    }
-
-    if let Some(app_data) = env::var_os("APPDATA") {
-        roots.push(PathBuf::from(app_data).join("npm"));
-    }
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        roots.push(home.join(".npm-global").join("lib"));
-        roots.push(home.join(".local").join("share").join("pnpm"));
-    }
-    if let Some(profile) = env::var_os("USERPROFILE") {
-        roots.push(
-            PathBuf::from(profile)
-                .join("AppData")
-                .join("Roaming")
-                .join("npm"),
-        );
-    }
-    roots
-}
-
-/// 根据全局 prefix 推导 DSH 包的 `lib/bin.js` 候选路径。
-///
-/// 参数：
-/// - `prefix`：PATH 中的 shim 目录或 npm 全局 prefix。
-///
-/// 返回值：既覆盖 Windows 的 `prefix/node_modules`，也覆盖 Unix 的
-/// `prefix/../lib/node_modules`。
-fn global_package_candidates(prefix: &Path) -> Vec<PathBuf> {
-    // 1. Windows / npm prefix 直接把 node_modules 放在 prefix 下。
-    // 2. Unix 的 shim 目录是 prefix/bin，模块在 prefix/lib/node_modules 下。
-    let mut candidates = vec![prefix.join(DSH_PACKAGE_BIN)];
-    if let Some(parent) = prefix.parent() {
-        candidates.push(parent.join("lib").join(DSH_PACKAGE_BIN));
-    }
-    candidates
+/// 返回值：装配阶段快照；等待页据此展示进度、错误与重试入口。
+#[tauri::command]
+pub fn runtime_status(state: State<'_, Arc<SidecarManager>>) -> RuntimeStatus {
+    // 1. 只读克隆状态，不把内部锁暴露给前端。
+    state.runtime_snapshot()
 }
 
 /// 构造 `<node> <bin.js> web --host 127.0.0.1 --port <port> --no-open` 命令。
@@ -1393,34 +1566,6 @@ fn terminate_process_tree(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 验证可选离线运行时目录能按约定解析出 Node 与 DSH 入口。
-    #[test]
-    fn resolves_bundled_runtime_layout() {
-        // 1. 在临时目录构造 runtime/node 与 runtime/dsh/lib/bin.js。
-        // 2. 断言来源为捆绑运行时且路径完全匹配。
-        // 3. 清理临时目录。
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = env::temp_dir().join(format!("inkdsh-runtime-{unique}"));
-        let node = root
-            .join("node")
-            .join(if cfg!(windows) { "node.exe" } else { "node" });
-        let bin = root.join("dsh").join("lib").join("bin.js");
-        fs::create_dir_all(node.parent().unwrap()).unwrap();
-        fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        fs::write(&node, b"").unwrap();
-        fs::write(&bin, b"").unwrap();
-
-        let spec = bundled_launch_spec(&root).expect("bundled runtime should resolve");
-        assert_eq!(spec.node, normalize_existing_path(&node));
-        assert_eq!(spec.bin, normalize_existing_path(&bin));
-        assert_eq!(spec.source, "捆绑运行时");
-
-        let _ = fs::remove_dir_all(root);
-    }
 
     /// 验证官方 stdout 就绪行能被完整解析为 URL 与端口。
     #[test]

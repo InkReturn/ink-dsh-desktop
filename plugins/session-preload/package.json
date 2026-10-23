@@ -1,0 +1,23 @@
+{
+  "name": "@inkdsh/session-preload",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "inkdsh host plugin: pre-fold recent session projections into memory on startup",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5"
+  }
+}

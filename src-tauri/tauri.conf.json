@@ -30,7 +30,8 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "resources": {
-      "resources/runtime/": "runtime/"
+      "resources/runtime/": "runtime/",
+      "resources/manifest.json": "manifest.json"
     }
   }
 }
