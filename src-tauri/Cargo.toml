@@ -1,0 +1,26 @@
+[package]
+name = "inkdsh"
+version = "0.1.0"
+description = "inkdsh desktop shell for DeepSeek Harness"
+authors = ["inkdsh contributors"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portpicker = "0.1"
+dunce = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }

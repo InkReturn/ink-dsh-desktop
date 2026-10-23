@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>inkdsh</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+        background: #080a0f;
+        color: #e8edf7;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+      }
+
+      body {
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at 50% 42%, rgba(68, 112, 255, 0.12), transparent 34%),
+          linear-gradient(180deg, #090b11 0%, #07090d 100%);
+      }
+
+      .shell {
+        width: min(520px, calc(100vw - 64px));
+        text-align: center;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: #f4f7ff;
+        font: 600 19px/1 "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+        letter-spacing: 0.02em;
+      }
+
+      .mark {
+        position: relative;
+        width: 34px;
+        height: 34px;
+        border: 1px solid rgba(130, 162, 255, 0.45);
+        border-radius: 10px;
+        background: linear-gradient(145deg, rgba(81, 122, 255, 0.3), rgba(28, 40, 76, 0.32));
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.1),
+          0 8px 30px rgba(38, 84, 255, 0.16);
+      }
+
+      .mark::before {
+        content: "";
+        position: absolute;
+        inset: 9px 8px;
+        border: 2px solid #9db6ff;
+        border-top-color: transparent;
+        border-radius: 50%;
+        animation: spin 1.7s linear infinite;
+      }
+
+      .status-wrap {
+        margin-top: 30px;
+        min-height: 52px;
+      }
+
+      .status {
+        font-size: 15px;
+        line-height: 1.7;
+        color: #aab4c8;
+      }
+
+      .status.is-ready {
+        color: #b9c8ff;
+      }
+
+      .status.is-error {
+        color: #ffb4b4;
+      }
+
+      .detail {
+        max-width: 100%;
+        margin: 12px auto 0;
+        overflow: hidden;
+        color: #7f8aa1;
+        font: 12px/1.65 "Cascadia Code", Consolas, monospace;
+        text-align: left;
+        text-overflow: ellipsis;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .error-mark::before {
+        border-color: #ff8a8a;
+        border-top-color: transparent;
+        animation-duration: 2.6s;
+      }
+
+      .retry {
+        margin-top: 22px;
+        border: 1px solid rgba(147, 171, 255, 0.32);
+        border-radius: 9px;
+        padding: 9px 18px;
+        background: rgba(78, 108, 205, 0.18);
+        color: #dce5ff;
+        font: 500 13px/1 "Segoe UI", "Microsoft YaHei UI", sans-serif;
+        cursor: pointer;
+        transition:
+          background 160ms ease,
+          border-color 160ms ease;
+      }
+
+      .retry:hover {
+        border-color: rgba(166, 188, 255, 0.58);
+        background: rgba(91, 124, 230, 0.28);
+      }
+
+      .retry:focus-visible {
+        outline: 2px solid rgba(166, 188, 255, 0.8);
+        outline-offset: 3px;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <div class="brand">
+        <span class="mark" id="mark" aria-hidden="true"></span>
+        <span>inkdsh</span>
+      </div>
+      <div class="status-wrap">
+        <div class="status" id="status" role="status" aria-live="polite">正在启动本地内核</div>
+        <pre class="detail" id="detail" hidden></pre>
+        <button class="retry" id="retry" type="button" hidden>重新启动内核</button>
+      </div>
+    </main>
+
+    <script>
+      (() => {
+        const status = document.getElementById("status");
+        const detail = document.getElementById("detail");
+        const mark = document.getElementById("mark");
+        const retry = document.getElementById("retry");
+        let polling = true;
+
+        // 以错误样式展示启动失败原因，并显示重试入口。
+        window.__inkdshShowError = (message) => {
+          polling = false;
+          status.textContent = message;
+          status.className = "status is-error";
+          mark.className = "mark error-mark";
+          detail.hidden = true;
+          retry.hidden = false;
+        };
+
+        // 从 Rust 侧轮询 sidecar 状态，全部渲染仍由等待页自己掌控。
+        async function pollSidecar() {
+          if (!polling) return;
+          const invoke = window.__TAURI__?.core?.invoke;
+          if (invoke) {
+            try {
+              const snapshot = await invoke("sidecar_status");
+              if (snapshot.state === "ready") {
+                status.textContent = "正在打开工作区";
+                status.className = "status is-ready";
+                setTimeout(pollSidecar, 600);
+                return;
+              }
+              if (snapshot.state === "failed" || snapshot.state === "stopped") {
+                window.__inkdshShowError(
+                  snapshot.message || "本地内核已停止，请重新启动 inkdsh",
+                );
+                return;
+              }
+            } catch {
+              // 桌面桥接尚未注入时继续等待，不把瞬时错误暴露给用户。
+            }
+          }
+          setTimeout(pollSidecar, 700);
+        }
+
+        // 用户点击重试后复位状态，由 Rust 重新走完整的 sidecar 启动流程。
+        retry.addEventListener("click", async () => {
+          const invoke = window.__TAURI__?.core?.invoke;
+          if (!invoke) return;
+          polling = true;
+          retry.hidden = true;
+          detail.hidden = true;
+          status.className = "status";
+          mark.className = "mark";
+          status.textContent = "正在重新启动本地内核";
+          try {
+            await invoke("sidecar_retry");
+            setTimeout(pollSidecar, 600);
+          } catch (error) {
+            window.__inkdshShowError(`重试失败：${String(error)}`);
+          }
+        });
+
+        pollSidecar();
+      })();
+    </script>
+  </body>
+</html>

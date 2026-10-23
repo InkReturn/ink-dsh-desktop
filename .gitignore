@@ -1,0 +1,25 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+.tauri/
+.temp/
+_ref/
+src-tauri/resources/runtime/node/
+src-tauri/resources/runtime/dsh/
+src-tauri/resources/runtime/runtime.json
+src-tauri/resources/runtime/.smoke.*
+*.log
+.DS_Store
+
+# 本地讨论、设计与 Agent 工作区，不入库
+docs/
+DESIGN.md
+PROMPT.md
+DEEPSEEK_PROMPTS.md
+.agents/
+
+# 本地环境变量
+.env
+.env.*
