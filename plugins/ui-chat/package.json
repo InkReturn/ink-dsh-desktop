@@ -14,16 +14,26 @@
     "lib"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "pnpm run build:host && pnpm run build:client",
+    "build:host": "tsc -p tsconfig.build.json",
+    "build:client": "node scripts/build-client.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dsh": {
     "client": {
       "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-workspace-controller",
+        "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-conversation",
-        "@deepseek-ai/dsh-client-ui-slots",
-        "@deepseek-ai/dsh-api-session-controller"
+        "@deepseek-ai/dsh-client-ui-input-trigger",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ],
       "platform": "web"
     }
@@ -32,6 +42,7 @@
     "@deepseek-ai/cordis": "^4.0.5"
   },
   "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.5",
     "@tanstack/react-virtual": "3.14.10"
   }
 }

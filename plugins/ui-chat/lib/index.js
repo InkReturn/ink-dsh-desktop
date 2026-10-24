@@ -1,7 +1,7 @@
 /**
  * `@inkdsh/ui-chat` host 入口。
  *
- * 纯客户端插件：host 侧没有行为，保留空 apply 以便被 Cordis 加载并让
- * `dsh.client` 声明被发现。
+ * 复用官方 host 半边的设置声明（transcriptView / collapseTiming /
+ * performanceUsage / linkOpening），使客户端设置表单与官方行为一致。
  */
-export function apply() { }
+export { apply, Config } from './official/host.js';
