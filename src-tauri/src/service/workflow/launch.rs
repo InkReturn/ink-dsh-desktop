@@ -724,6 +724,11 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     if let Err(e) = crate::service::patch::chat_stream_batch::apply(&app_handle) {
         log::warn!("Chat stream batch patch skipped: {e}");
     }
+    // 屏外消息行跳过布局/绘制：官方 CSS 由运行时注入，类名是 CSS Modules 哈希；补丁不改官方
+    // 文本，而是在类名映射对象之后追加一条独立 <style>，哈希变了也跟着走。最佳努力且幂等。
+    if let Err(e) = crate::service::patch::chat_content_visibility::apply(&app_handle) {
+        log::warn!("Chat content visibility patch skipped: {e}");
+    }
     if let Err(e) = crate::service::patch::mobile_composer::apply(&app_handle) {
         log::warn!("mobile composer patch failed: {e}");
     }

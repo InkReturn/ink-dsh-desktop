@@ -1,0 +1,22 @@
+		var ChatView_module_css_default = {
+			"callRow": "EvIC1a_callRow",
+			"column": "EvIC1a_column",
+			"flowItem": "EvIC1a_flowItem",
+			"frame": "EvIC1a_frame",
+			"hint": "EvIC1a_hint",
+			"modalAction": "EvIC1a_modalAction",
+			"older": "EvIC1a_older",
+			"openError": "EvIC1a_openError",
+			"root": "EvIC1a_root",
+			"running": "EvIC1a_running",
+			"runningContent": "EvIC1a_runningContent",
+			"runningDivider": "EvIC1a_runningDivider",
+			"runningIcon": "EvIC1a_runningIcon",
+			"runningText": "EvIC1a_runningText",
+			"runningWhaleAnimated": "EvIC1a_runningWhaleAnimated",
+			"runningWhaleStill": "EvIC1a_runningWhaleStill",
+			"scroll": "EvIC1a_scroll",
+			"toBottom": "EvIC1a_toBottom",
+			"toBottomSlot": "EvIC1a_toBottomSlot",
+			"turnSpacer": "EvIC1a_turnSpacer"
+		};
