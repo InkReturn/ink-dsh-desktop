@@ -131,12 +131,47 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - 目标：旧机实测基线 49–51 fps → 本机复测滚动 ≥55 fps；切换 5 个会话均值对比。
 - 性能前后对照写进 `docs/perf/baseline-vs-mod.md`。
 
-### P3：会话投影预折叠（3–4 天）
+### P3：多 Host 切换 + 远程资源缓存（5–7 天）
+
+> 动机：多 Host 切到远程时，该 Host 的前端 + 插件 bundle（~14MB，未压缩、`max-age=300`、无 ETag）要从网络下载——局域网 1.8s 可忍，frp 公网冷启动 **21 秒**，且缓存 5 分钟过期后反复重下。**网一慢，切 Host 就卡死。**
+
+#### 3a. 摸清上游已有能力（0.5 天）
+
+先读 `packages/dsh-tauri-remote/src/**/plugins-sync.ts`（6.9KB 带测试）和 `tunnel.ts`（10.5KB），确认：
+- 它是"把本地插件装到远程"还是"缓存远程插件 bundle"？
+- 与 `frontend_preload.rs` 的拦截器如何协作？
+- 已有能力覆盖到哪个程度，我们缺什么补什么，**不重复造**。
+
+#### 3b. 远程资源磁盘缓存（2–3 天）
+
+- 拦截器扩展：`frontend_preload.rs` 目前只拦 `http://127.0.0.1:*/*`；扩展为同时拦已配置的远程 Host 源（按 origin 匹配）。
+- 缓存键：`(hostId, 路径, 内容hash或ETag)`；哈希文件名的资源（`/assets/index-8f3a2.js` 这类）视为**永久缓存**，不再回源校验。
+- 缓存位置：`<appData>/inkdsh/cache/<hostId>/`，磁盘占用上限 500MB，LRU 淘汰。
+- 失败回退：缓存读取失败一律放行网络请求，绝不白屏。
+
+#### 3c. 后台预加载（1–2 天）
+
+- 连上一个远程 Host 后，后台静默并发拉取它首页 HTML 引用的全部静态资源，存入缓存。
+- 预加载只抢闲时带宽：检测到用户正在打字/流式输出时暂停。
+- 已缓存过的 Host 二次访问：目标冷启动 ≤1s（局域网/公网同标准）。
+
+#### 3d. 多 Host 切换验收（1 天）
+
+| 场景 | 指标 |
+|---|---|
+| 切到缓存过的远程 Host | 前端加载 ≤1s，无全量下载 |
+| 断网切到缓存过的 Host | 界面可渲染，提示"离线模式"，不发请求 |
+| 远程 Host 插件更新后 | 校验发现 hash 变化，增量只下变化的包 |
+| 切回本机 | 走原有本地预载路径，不受影响 |
+
+产出：缓存命中率与加载耗时的实测表，写进 `docs/perf/remote-cache.md`。
+
+### P4：会话投影预折叠（3–4 天）
 
 - 按 P-1 探针 4 的选型落地。
 - 指标：切会话 ≤500ms（命中时），不破坏上游 session 流程。
 
-### P4：总验收（1–2 天）
+### P5：总验收（1–2 天）
 
 - 过一遍 §6 验收表。
 - 更新 `FORK_BASELINE.md` 的补丁清单表。
@@ -152,6 +187,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 | BatchBuffer 与上游流式协议不兼容（如 turn 事件结构变了） | P-1 探针先验证；不兼容就放弃该补丁，不做架空的"兼容性封装" |
 | `content-visibility` 在 WebView2 155 上有 bug（已知某些版本对动态插入节点表现差） | P-1 先跑 fps 对照；不达标就撤这个补丁，保留批量渲染也行 |
 | 预折叠读取了被截断的 projcache（之前事故的遗留） | 解析失败静默跳过，一律不删不改 |
+| 远程缓存存了旧版 bundle，前端与内核版本不匹配 | 缓存键含 host 的 dsh 版本号；版本变化即整 host 缓存作废重拉 |
+| 缓存目录无限膨胀 | 每 host 上限 + 全局 500MB LRU；设置页给"清空缓存"按钮 |
 | 把 fork main 当工作分支用了 | 建分支前检查 `git branch --show-current`；分支模型图贴在 `FORK_BASELINE.md` |
 
 ---
@@ -161,6 +198,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - [ ] `pnpm dev` 冷启动到界面 ≤ 5s（含核心自愈流程；机器基线记录）
 - [ ] 万级 DOM 会话滚动 ≥55 fps
 - [ ] 5 个会话切换均值 ≤500ms（命中预载）
+- [ ] 切到缓存过的远程 Host，前端加载 ≤1s；断网可渲染（离线提示）
+- [ ] 远程缓存：hash 变化的资源增量更新，无全量重下
 - [ ] 补丁全部按 best-effort 走，任意一个补丁失配都能启动成功
 - [ ] `pnpm test` / `typecheck` / `build` / `cargo clippy` / `cargo test` 全绿，记录实际用例数
 - [ ] `FORK_BASELINE.md` 新增补丁登记完整
