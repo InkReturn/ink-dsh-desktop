@@ -718,6 +718,12 @@ pub async fn launch(app_handle: tauri::AppHandle) -> Result<(), String> {
     if let Err(e) = crate::service::patch::chat_follow_anchor::apply(&app_handle) {
         log::warn!("Chat follow anchor patch skipped: {e}");
     }
+    // 流式 token 只订阅层压批：官方每个 token 换一次节点对象就重渲染一次整条消息
+    // （含 markdown 重解析）。补丁把 ChatNodeSeat 的渲染快照压到每 100ms 一次，
+    // 不改 store/order/导航/滚动跟随。最佳努力且幂等：锚点缺失时安全跳过。
+    if let Err(e) = crate::service::patch::chat_stream_batch::apply(&app_handle) {
+        log::warn!("Chat stream batch patch skipped: {e}");
+    }
     if let Err(e) = crate::service::patch::mobile_composer::apply(&app_handle) {
         log::warn!("mobile composer patch failed: {e}");
     }

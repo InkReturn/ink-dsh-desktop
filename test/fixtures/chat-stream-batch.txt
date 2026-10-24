@@ -1,0 +1,16 @@
+			return location?.kind === "turn" || location?.kind === "step" ? location.turn.turn : void 0;
+		}
+		/**
+		* Subscribe, apply Turn-process visibility, and dispatch one stable Context key.
+		* Policy reads select this seat's own conclusion, so a mode change re-renders
+		* only seats whose visibility actually changes.
+		*/
+		const ChatNodeSeat = (0, react.memo)(function ChatNodeSeat({ nodeKey, groupPart, useChatNode, useChatNodeProcess, usePresentation, cwd, openFile, inspectCall, forkAt, loadImage, fileMentions, useStore, actions, renderSlot, t, useChatNodeBottom, deferCollapse, useGroupAction }) {
+			const bottom = useChatNodeBottom(nodeKey);
+			const node = useChatNode(nodeKey);
+			const routedNode = node;
+			const turn = turnOf$1(routedNode);
+			const processPresentation = useChatNodeProcess(nodeKey);
+			const processSpec = processPresentation?.spec;
+			const storedOpen = useStore((state) => processSpec !== void 0 && turnProcessOpen(state, processSpec, bottom === true && deferCollapse));
+			const liveProcess = processPresentation !== void 0 && !processPresentation.turnClosed;
