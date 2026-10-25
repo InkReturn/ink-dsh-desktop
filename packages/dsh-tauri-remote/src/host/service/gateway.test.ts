@@ -6,8 +6,10 @@ import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { createServer, request as httpRequest } from 'node:http'
+import { createServer as createHttpsServer } from 'node:https'
 import { connect, createServer as createNetServer } from 'node:net'
 import { networkInterfaces } from 'node:os'
+import tls from 'node:tls'
 import * as zlib from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { GATEWAY_SESSION_HEADER, GATEWAY_SOURCE_HEADER } from '../config/constants'
@@ -20,6 +22,25 @@ import { consumePairingCode, PAIRING_TTL_MS, pairingCodeOf, resetPairingCode } f
 const SESSION = ensureSourceSession()
 
 const MIN_BYTES = 1024
+
+const TLS_FIXTURE = {
+  key: `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyMvmJLOFyt7nNGFb
+HWBw+1HHwPnDS1XxOKvWhe2Bfc2hRANCAAQ0D7XgueEiVYKwfz5ieVlTkaClgiVT
+Fdej1Eews1GOt6bymwLLpu42Bbnkg24Q6FZmjkET1GkGyksl0WcydgJ6
+-----END PRIVATE KEY-----`,
+  cert: `-----BEGIN CERTIFICATE-----
+MIIBmTCCAT+gAwIBAgIUJmVfdPYvPnnI/0uqWg6yP6ati8YwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJZHNocy50ZXN0MB4XDTI2MTAyNDIyMzQwNVoXDTM2MTAyMTIy
+MzQwNVowFDESMBAGA1UEAwwJZHNocy50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAENA+14LnhIlWCsH8+YnlZU5GgpYIlUxXXo9RHsLNRjrem8psCy6buNgW5
+5INuEOhWZo5BE9RpBspLJdFnMnYCeqNvMG0wHQYDVR0OBBYEFMh5BzMdQQy+Avx4
+DtONB5wZaptQMB8GA1UdIwQYMBaAFMh5BzMdQQy+Avx4DtONB5wZaptQMA8GA1Ud
+EwEB/wQFMAMBAf8wGgYDVR0RBBMwEYIJZHNocy50ZXN0hwR/AAABMAoGCCqGSM49
+BAMCA0gAMEUCIBh0sYCP9583WrwHw5tZED7jIVXKbKwSGbV0Ntyqc1bzAiEAowv+
+4RF70qX/NQL41GIs643LfjrqzrYz5E2k062r+jw=
+-----END CERTIFICATE-----`,
+}
 
 const CLOUDFLARE_RELAYED: IncomingHttpHeaders = {
   'cf-ray': 'a4d155e90a5f78dd-LAX',
@@ -369,6 +390,68 @@ function startFakeUpstream(): Promise<FakeUpstream> {
   })
 }
 
+interface SecureUpstream {
+  port: number
+  origin: string
+  calls: UpstreamCall[]
+  servernames: string[]
+  close: () => Promise<void>
+}
+
+async function secureUpstream(): Promise<SecureUpstream> {
+  const calls: UpstreamCall[] = []
+  const servernames: string[] = []
+  const sockets = new Set<Duplex>()
+  const server = createHttpsServer(TLS_FIXTURE, (request, response) => {
+    calls.push({ method: request.method ?? '', url: request.url ?? '', headers: request.headers })
+    const servername = (request.socket as tls.TLSSocket).servername
+    servernames.push(typeof servername === 'string' ? servername : '')
+    const url = new URL(request.url ?? '/', 'https://dshs.test')
+    if (url.pathname === '/' && url.searchParams.get('token') === 'launch-token-direct') {
+      response.writeHead(303, { 'set-cookie': ['dsh-direct=minted; Path=/; HttpOnly', 'theme=dark; Path=/'] })
+      response.end()
+      return
+    }
+    if (url.pathname === '/api/ping' && request.headers.cookie?.includes('dsh-direct=minted') && request.headers.cookie.includes('theme=dark')) {
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'set-cookie': 'upstream=kept; Path=/; HttpOnly' })
+      response.end('secure')
+      return
+    }
+    response.writeHead(401)
+    response.end()
+  })
+  server.on('upgrade', (request, socket) => {
+    calls.push({ method: request.method ?? '', url: request.url ?? '', headers: request.headers })
+    servernames.push((request.socket as tls.TLSSocket).servername || '')
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nupgrade: websocket\r\n\r\n')
+    socket.write('secure:upgrade')
+    socket.on('data', chunk => socket.write(Buffer.concat([Buffer.from('secure:'), chunk])))
+  })
+  server.on('secureConnection', (socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  const originalConnect = tls.connect
+  vi.spyOn(tls, 'connect').mockImplementation(((options: tls.ConnectionOptions, secureConnectListener?: () => void) => {
+    if (options.host !== 'dshs.test')
+      return originalConnect(options, secureConnectListener)
+    return originalConnect({ ...options, host: '127.0.0.1', port, ca: TLS_FIXTURE.cert }, secureConnectListener)
+  }) as typeof tls.connect)
+  return {
+    port,
+    origin: `https://dshs.test:${port}`,
+    calls,
+    servernames,
+    close: () => new Promise<void>((done) => {
+      for (const socket of sockets)
+        socket.destroy()
+      server.close(() => done())
+    }),
+  }
+}
+
 interface RawUpstream {
   port: number
   origin: string
@@ -691,6 +774,68 @@ afterEach(async () => {
 })
 
 describe('gateway 转发与 DSH 原生 cookie 注入', () => {
+  it('hTTPS 上游使用 TLS、上游 Host 与 SNI，并把一次铸造的全部 set-cookie 注入后续请求', async () => {
+    const secure = await secureUpstream()
+    try {
+      const events: RemoteGatewayEvent[] = []
+      const unsubscribe = gateway.subscribe(event => events.push(event))
+      const status = await gateway.start({
+        id: 'direct',
+        kind: 'outbound',
+        upstream: secure.origin,
+        port: 0,
+        tokenProvider: async () => `${secure.origin}/?token=launch-token-direct`,
+      })
+      const reply = await call(status.port, '/api/ping')
+      unsubscribe()
+      expect(reply.status, reply.body.toString()).toBe(200)
+      expect(reply.body.toString()).toBe('secure')
+      expect(reply.headers['set-cookie']).toEqual(['upstream=kept; Path=/; HttpOnly'])
+      expect(secure.calls.map(entry => entry.url)).toEqual(['/?token=launch-token-direct', '/api/ping'])
+      for (const call of secure.calls) {
+        expect(call.headers.host).toBe(`dshs.test:${secure.port}`)
+        expect(call.headers.origin).toBeUndefined()
+      }
+      expect(secure.servernames).toEqual(['dshs.test', 'dshs.test'])
+      expect(JSON.stringify(events)).not.toContain('launch-token-direct')
+    }
+    finally {
+      await secure.close()
+    }
+  })
+
+  it('token URL 指向其它 origin 时不向该主机发请求，也不记录 token', async () => {
+    const events: RemoteGatewayEvent[] = []
+    const unsubscribe = gateway.subscribe(event => events.push(event))
+    const status = await startEntry('outbound', upstream, {
+      tokenProvider: async () => 'https://other.test/?token=do-not-expose',
+    })
+    const reply = await call(status.port, '/api/ping')
+    unsubscribe()
+    expect(reply.status).toBe(401)
+    expect(upstream.calls).toHaveLength(1)
+    expect(upstream.calls[0]?.url).toBe('/api/ping')
+    expect(JSON.stringify(events)).not.toContain('do-not-expose')
+  })
+
+  it('hTTPS 上游的 Upgrade 也使用 TLS', async () => {
+    const secure = await secureUpstream()
+    try {
+      const status = await gateway.start({ id: 'direct', kind: 'outbound', upstream: secure.origin, port: 0 })
+      const reply = await upgraded(status.port, '/api/remote.mux', {})
+      expect(reply.status).toBe(101)
+      expect((await once(reply.socket, 'data'))[0].toString()).toBe('secure:upgrade')
+      expect(secure.calls.at(-1)?.headers.host).toBe(`dshs.test:${secure.port}`)
+      expect(secure.servernames).toEqual(['dshs.test'])
+      reply.socket.write('ping')
+      expect((await once(reply.socket, 'data'))[0].toString()).toBe('secure:ping')
+      reply.socket.destroy()
+    }
+    finally {
+      await secure.close()
+    }
+  })
+
   it('自动铸造并注入上游会话 cookie，浏览器侧无需任何凭据', async () => {
     const status = await startEntry('outbound', upstream, { tokenProvider: upstream.mintUrlFor })
     const reply = await call(status.port, '/api/ping')
@@ -2553,6 +2698,14 @@ describe('gateway Upgrade 例外', () => {
 })
 
 describe('gateway 监听生命周期', () => {
+  it('只接受 HTTP 或 HTTPS 根路径上游，其他协议与非根路径都在监听前拒绝', async () => {
+    await expect(gateway.start({ id: 'ftp', kind: 'outbound', upstream: 'ftp://dshs.test/', port: 0 })).rejects.toThrow('http 或 https')
+    await expect(gateway.start({ id: 'path', kind: 'outbound', upstream: 'https://dshs.test/base', port: 0 })).rejects.toThrow('/ 路径')
+    expect(gateway.status('ftp')).toBeUndefined()
+    expect(gateway.status('path')).toBeUndefined()
+    await expect(gateway.start({ id: 'http', kind: 'outbound', upstream: upstream.origin, port: 0 })).resolves.toMatchObject({ upstream: upstream.origin })
+  })
+
   it('端口占用时回落到下一个可用端口，状态与入口 URL 反映真实端口', async () => {
     const occupied = await occupiedPortWithFreeNext()
     const status = await gateway.start({ id: 'entry', kind: 'inbound', upstream: upstream.origin, port: occupied.port, tokenProvider: upstream.mintUrlFor })

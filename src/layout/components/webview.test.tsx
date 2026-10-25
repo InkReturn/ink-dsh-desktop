@@ -36,7 +36,7 @@ vi.mock('./navbar', () => ({
 }))
 vi.mock('./iframe', () => ({
   Iframe: ({ iframeRef, srcOverride }: IframeProps) => (
-    <iframe key={srcOverride} ref={iframeRef} src={srcOverride ?? 'http://127.0.0.1:3081'} title="session" />
+    <iframe data-remote-url={srcOverride ?? ''} ref={iframeRef} src={srcOverride ?? 'http://127.0.0.1:3081'} title="session" />
   ),
 }))
 
@@ -67,10 +67,32 @@ it('logs the selected shell branch and deduplicates unrelated rerenders without 
   mocks.harness.status = 'ready'
   mocks.harness.serviceHealthy = false
   view.rerender(<Webview />)
-  act(() => navbar().onRemoteChange('https://example.test/?token=secret', null))
+  act(() => navbar().onRemoteChange('https://example.test/?token=secret', null, 'example'))
   expect(console.warn).toHaveBeenLastCalledWith('[Webview] shell view', expect.objectContaining({ branch: 'iframe', remoteMode: true, serviceHealthy: false }))
   expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain('secret')
   expect(console.warn).toHaveBeenCalledTimes(6)
+})
+
+it('keeps visited Host iframes alive and only changes visibility when switching', () => {
+  const view = render(<Webview />)
+  act(() => navbar().onRemoteChange('http://127.0.0.1:4001', null, 'lan'))
+  act(() => navbar().onRemoteChange('http://127.0.0.1:4002', null, 'inkmo'))
+  const first = view.container.querySelector('[data-remote-url="http://127.0.0.1:4001"]')
+  const second = view.container.querySelector('[data-remote-url="http://127.0.0.1:4002"]')
+  expect(first).not.toBeNull()
+  expect(second).not.toBeNull()
+  expect(view.container.querySelectorAll('iframe')).toHaveLength(2)
+  expect(first?.parentElement?.style.visibility).toBe('hidden')
+  expect(second?.parentElement?.style.visibility).toBe('visible')
+  act(() => navbar().onRemoteChange('http://127.0.0.1:4001', null, 'lan'))
+  expect(view.container.querySelector('[data-remote-url="http://127.0.0.1:4001"]')).toBe(first)
+  expect(view.container.querySelector('[data-remote-url="http://127.0.0.1:4002"]')).toBe(second)
+  expect(view.container.querySelectorAll('iframe')).toHaveLength(2)
+  expect(first?.parentElement?.style.visibility).toBe('visible')
+  expect(second?.parentElement?.style.visibility).toBe('hidden')
+  act(() => navbar().onRemoteChange('http://127.0.0.1:4003', null, 'lan'))
+  expect(view.container.querySelector('[data-remote-url="http://127.0.0.1:4003"]')).not.toBeNull()
+  expect(view.container.querySelectorAll('iframe')).toHaveLength(2)
 })
 
 function navbar() {

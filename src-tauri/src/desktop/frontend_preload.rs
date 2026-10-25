@@ -7,9 +7,10 @@ use tauri::{AppHandle, Manager, Url, WebviewWindow, Wry};
 const PRELOAD_QUERY: &str = "_dshPreload";
 const GATE_SCRIPT: &str = include_str!("frontend_preload.js.inc");
 #[cfg(any(windows, test))]
-const RESOURCE_FILTERS: [(&str, bool); 5] = [
+const RESOURCE_FILTERS: [(&str, bool); 6] = [
     ("http://127.0.0.1:*/*", true),
     ("http://127.0.0.1:*/assets/*", false),
+    ("http://127.0.0.1:*/plugins/*", false),
     ("http://127.0.0.1:*/manifest.webmanifest*", false),
     ("http://127.0.0.1:*/favicon.svg*", false),
     ("http://127.0.0.1:*/favicon-dark.svg*", false),
@@ -20,6 +21,14 @@ struct WindowPreload {
     generation: u64,
     frontend: Option<Frontend>,
     serving: bool,
+    remote: Option<RemoteFrontend>,
+}
+
+#[derive(Clone)]
+struct RemoteFrontend {
+    host_id: String,
+    identity: String,
+    origin: String,
 }
 
 struct Frontend {
@@ -33,6 +42,70 @@ struct Frontend {
 fn windows() -> &'static Mutex<HashMap<String, Arc<Mutex<WindowPreload>>>> {
     static WINDOWS: OnceLock<Mutex<HashMap<String, Arc<Mutex<WindowPreload>>>>> = OnceLock::new();
     WINDOWS.get_or_init(Mutex::default)
+}
+
+fn remote_binding(window: &str) -> Option<Arc<Mutex<WindowPreload>>> {
+    windows()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(window)
+        .cloned()
+}
+
+/// 每次窗口实际切换 Host 时由壳层调用。只替换这个窗口的 origin 绑定，不删除其它 Host
+/// 的缓存，也不影响其它远程窗口。空 URL 表示回到本机。
+#[tauri::command]
+pub(crate) fn bind_remote_frontend(
+    window: WebviewWindow<Wry>,
+    host_id: String,
+    gateway_url: String,
+    identity: String,
+) -> Result<(), String> {
+    let Some(slot) = remote_binding(window.label()) else { return Ok(()) };
+    let remote = if gateway_url.is_empty() {
+        None
+    } else {
+        let url = Url::parse(&gateway_url).map_err(|error| format!("REMOTE_CACHE_URL: {error}"))?;
+        if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") || url.port().is_none()
+            || host_id.is_empty() || identity.is_empty() || identity.len() > 1024
+            || !host_id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err("REMOTE_CACHE_URL: expected a loopback gateway and a safe hostId".into());
+        }
+        Some(RemoteFrontend { host_id, identity, origin: url.origin().ascii_serialization() })
+    };
+    let mut state = slot.lock().unwrap_or_else(|error| error.into_inner());
+    apply_remote_binding(&mut state, remote);
+    Ok(())
+}
+
+fn apply_remote_binding(state: &mut WindowPreload, remote: Option<RemoteFrontend>) {
+    let entering_remote = remote.is_some();
+    state.remote = remote;
+    // 远端 Host 激活后本机 preload 已不再服务任何请求；保留 frontend 会挡住远程缓存分支。
+    if entering_remote {
+        state.frontend = None;
+        state.serving = false;
+    }
+}
+
+fn cached_remote(
+    root: &Path,
+    remote: Option<RemoteFrontend>,
+    url: &Url,
+) -> Option<super::remote_cache::CachedAsset> {
+    let remote = remote?;
+    if url.origin().ascii_serialization() != remote.origin {
+        return None;
+    }
+    let mut key = url.path().to_owned();
+    if let Some(query) = url.query() {
+        key.push('?');
+        key.push_str(query);
+    }
+    let asset = super::remote_cache::read(root, &remote.host_id, &remote.identity, &key);
+    log::debug!(target: "inkdsh::remote_cache", "REQ host={} path={} hit={}", remote.host_id, url.path(), asset.is_some());
+    asset
 }
 
 fn frontend_root(core: &Path) -> Option<PathBuf> {
@@ -192,6 +265,9 @@ pub async fn prepare_frontend_preload(
         log::warn!("FRONTEND_PRELOAD_UNSUPPORTED: active frontend is missing or has no boot gate");
     }
     state.frontend = frontend;
+    if state.frontend.is_some() {
+        state.remote = None;
+    }
     Ok(state.frontend.as_ref().map(|_| url))
 }
 
@@ -256,6 +332,29 @@ pub fn install(
                         crate::service::workflow::instances::port(parent.app_handle())
                     });
                     let mut state = state_for_request.lock().unwrap_or_else(|error| error.into_inner());
+                    let cache_hit = if state.frontend.is_none() {
+                        let root = crate::config::get_base_dir(parent.app_handle()).join("inkdsh/remote-cache");
+                        cached_remote(&root, state.remote.clone(), &url)
+                    } else { None };
+                    if let Some(cached) = cache_hit {
+                        drop(state);
+                        let headers = HSTRING::from(format!("Content-Type: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Inkdsh-Cache: HIT\r\n", cached.content_type));
+                        let Ok(length) = u32::try_from(cached.body.len()) else { return Ok(()) };
+                        let stream = if method == "HEAD" { std::ptr::null_mut() } else {
+                            windows_sys::Win32::UI::Shell::SHCreateMemStream(cached.body.as_ptr(), length)
+                        };
+                        if stream.is_null() && method != "HEAD" && !cached.body.is_empty() { return Ok(()) }
+                        let mut response = std::ptr::null_mut();
+                        let reason = HSTRING::from("OK");
+                        let status = (environment.vtable().CreateWebResourceResponse)(
+                            environment.as_raw(), stream, 200, windows_core::PCWSTR(reason.as_ptr()),
+                            windows_core::PCWSTR(headers.as_ptr()), &mut response,
+                        );
+                        if !stream.is_null() { drop(windows_core::IUnknown::from_raw(stream)); }
+                        status.ok()?;
+                        args.SetResponse(&ICoreWebView2WebResourceResponse::from_raw(response))?;
+                        return Ok(());
+                    }
                     let Some(frontend) = state.frontend.as_ref() else { return Ok(()) };
                     if profile != frontend.profile || url.origin().ascii_serialization() != frontend.origin || url.port_or_known_default() != Some(port) {
                         return Ok(());
@@ -324,11 +423,40 @@ mod tests {
             [
                 ("http://127.0.0.1:*/*", true),
                 ("http://127.0.0.1:*/assets/*", false),
+                ("http://127.0.0.1:*/plugins/*", false),
                 ("http://127.0.0.1:*/manifest.webmanifest*", false),
                 ("http://127.0.0.1:*/favicon.svg*", false),
                 ("http://127.0.0.1:*/favicon-dark.svg*", false),
             ]
         );
+    }
+
+    #[test]
+    fn remote_binding_clears_local_preload_state() {
+        let mut state = WindowPreload {
+            frontend: Some(Frontend {
+                profile: "tauri".into(),
+                origin: "http://127.0.0.1:3081".into(),
+                id: "preload".into(),
+                root: PathBuf::from("."),
+                index: Vec::new(),
+            }),
+            serving: true,
+            ..WindowPreload::default()
+        };
+        apply_remote_binding(
+            &mut state,
+            Some(RemoteFrontend {
+                host_id: "lan".into(),
+                identity: "http://192.168.31.83:3080".into(),
+                origin: "http://127.0.0.1:4001".into(),
+            }),
+        );
+        assert!(state.frontend.is_none());
+        assert!(!state.serving);
+        assert!(state.remote.is_some());
+        apply_remote_binding(&mut state, None);
+        assert!(state.remote.is_none());
     }
 
     #[test]

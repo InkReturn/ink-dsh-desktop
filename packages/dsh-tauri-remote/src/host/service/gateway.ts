@@ -2,14 +2,16 @@ import type { ClientRequest, IncomingMessage, OutgoingHttpHeaders, Server, Serve
 import type { Duplex, Readable, Transform, Writable } from 'node:stream'
 import type { RemoteAuthFailureRecord, RemoteAuthPolicy, RemoteGatewayEntryKind, RemoteGatewayEntryStatus, RemoteGatewayEvent, RemoteGatewayEventKind, RemoteGatewayStartOptions, RemoteGatewayTokenProvider, RemoteSessionTicket, RemoteSourceClass } from '../types/index'
 import { Buffer } from 'node:buffer'
-import { createServer, request as httpRequest } from 'node:http'
+import { createServer } from 'node:http'
+import process from 'node:process'
 import { pipeline } from 'node:stream'
 import { defineService } from 'dsh-tauri'
 import { messageOf } from '../../shared/error'
 import { ensureSourceSession } from '../config/runtime'
 import { rateLimitAfterFailure, rateLimitBlockedMs, signDeviceSession, signSession, tokenMatches, verifyDeviceSession, verifySession } from '../utils/auth'
 import { classifySource, decideSourceAccess, isAuthConfigured, rateLimitKeyOf } from '../utils/source'
-import { authorityFor, cookiePairsOf, createCompressor, createDecompressor, deniedHtml, entryUrlOf, forwardHeadersOf, isCrossSiteRequest, isNavigationRequest, isReplayable, isUpgradeOf, loginPageHtml, mergeCookieHeader, parseCookieHeader, parseFormField, responseHeadersOf, responsePlanOf, supportsZstd, tunnelClientIpOf, upstreamPortOf } from './gateway.utils'
+import { authorityFor, cookiePairsOf, createCompressor, createDecompressor, deniedHtml, entryUrlOf, forwardHeadersOf, isCrossSiteRequest, isNavigationRequest, isReplayable, isUpgradeOf, loginPageHtml, mergeCookieHeader, mintRequestUrlOf, parseCookieHeader, parseFormField, responseHeadersOf, responsePlanOf, supportsZstd, tunnelClientIpOf, upstreamRequest } from './gateway.utils'
+import { cacheBody, cachePathOf, isCacheableResponse } from './static-cache'
 
 const LOOPBACK = '127.0.0.1'
 
@@ -59,6 +61,13 @@ interface GatewayEntry {
   tokenProvider: RemoteGatewayTokenProvider | undefined
   auth: (() => RemoteAuthPolicy) | undefined
   publicHost: (() => string | undefined) | undefined
+  upstreamAuthority?: boolean
+  cacheHostId?: string
+  cacheIdentity?: string
+  cookieProvider?: () => Promise<string | undefined>
+  /** 非预加载请求的并发数；预加载请求带 x-inkdsh-prefetch，不参与闲时判断。 */
+  activeUserRequests: number
+  lastUserActivityAt: number
 }
 
 interface ForwardAttempt {
@@ -112,6 +121,12 @@ export const gateway = defineService({
     return [...entries.values()].map(entryStatus)
   },
 
+  /** 预加载调度用：用户请求仍活跃或刚结束多久。 */
+  activity(id: string): { active: number, idleMs: number } | undefined {
+    const entry = entries.get(id)
+    return entry === undefined ? undefined : { active: entry.activeUserRequests, idleMs: Date.now() - entry.lastUserActivityAt }
+  },
+
   subscribe(listener: (event: RemoteGatewayEvent) => void): () => void {
     subscribers.add(listener)
     return () => {
@@ -135,14 +150,16 @@ export const gateway = defineService({
 async function startEntry(options: RemoteGatewayStartOptions): Promise<RemoteGatewayEntryStatus> {
   await stopEntry(options.id)
   const upstream = new URL(options.upstream)
-  if (upstream.protocol !== 'http:')
-    throw new TypeError(`网关上游必须是 http URL：${options.upstream}`)
+  if (upstream.protocol !== 'http:' && upstream.protocol !== 'https:')
+    throw new TypeError(`网关上游必须是 http 或 https URL：${options.upstream}`)
+  if (upstream.pathname !== '/')
+    throw new TypeError('网关上游只允许 / 路径')
   const host = options.kind === 'inbound' ? options.host ?? LOOPBACK : LOOPBACK
   const entry: GatewayEntry = {
     id: options.id,
     kind: options.kind,
     upstream,
-    authority: authorityFor(options.kind, upstream, options.port),
+    authority: options.upstreamAuthority === true ? upstream.host : authorityFor(options.kind, upstream, options.port),
     host,
     port: 0,
     listening: false,
@@ -154,6 +171,12 @@ async function startEntry(options: RemoteGatewayStartOptions): Promise<RemoteGat
     tokenProvider: options.tokenProvider,
     auth: options.auth,
     publicHost: options.publicHost,
+    upstreamAuthority: options.upstreamAuthority === true,
+    ...options.kind === 'outbound' ? { cacheHostId: options.id.slice('remote-outbound:'.length) } : {},
+    ...options.cacheIdentity === undefined ? {} : { cacheIdentity: options.cacheIdentity },
+    ...options.cookieProvider === undefined ? {} : { cookieProvider: options.cookieProvider },
+    activeUserRequests: 0,
+    lastUserActivityAt: Date.now(),
   }
   entries.set(entry.id, entry)
   try {
@@ -171,6 +194,8 @@ async function startEntry(options: RemoteGatewayStartOptions): Promise<RemoteGat
   if (options.port !== 0 && entry.port !== options.port)
     emit(entry, 'port', `首选端口 ${options.port} 不可用，已回落到 ${entry.port}`)
   emit(entry, 'listening', `网关入口已监听 ${entryUrlOf(entry.host, entry.port)}，上游 ${options.upstream}`)
+  if (options.initialCookie !== undefined)
+    mintedCookies.set(entry.authority, options.initialCookie)
   return entryStatus(entry)
 }
 
@@ -281,6 +306,14 @@ function listenAt(entry: GatewayEntry, port: number): Promise<Server> {
 }
 
 function handleRequest(entry: GatewayEntry, request: IncomingMessage, response: ServerResponse): Promise<void> {
+  if (request.headers['x-inkdsh-prefetch'] !== '1') {
+    entry.activeUserRequests += 1
+    entry.lastUserActivityAt = Date.now()
+    response.once('close', () => {
+      entry.activeUserRequests = Math.max(0, entry.activeUserRequests - 1)
+      entry.lastUserActivityAt = Date.now()
+    })
+  }
   return dispatchRequest(entry, request, response).catch((error) => {
     writeGatewayError(entry, response, 500, `网关请求处理失败：${messageOf(error)}`)
   })
@@ -471,6 +504,7 @@ async function forward(entry: GatewayEntry, request: IncomingMessage, response: 
   const inject = entry.kind !== 'outbound'
   const headers = forwardHeadersOf(request.headers, {
     authority: entry.authority,
+    scheme: entry.upstreamAuthority === true ? entry.upstream.protocol : undefined,
     upgrade: isUpgradeOf(request.headers),
     ...inject ? { source, session } : { source: 'public', session: 'outbound' },
     ...entry.kind === 'outbound' ? { identity: true } : {},
@@ -485,13 +519,10 @@ function sendUpstream(entry: GatewayEntry, request: IncomingMessage, response: S
   if (request.socket.destroyed || response.destroyed)
     return Promise.resolve()
   return new Promise((resolve) => {
-    const upstream = httpRequest({
-      host: entry.upstream.hostname,
-      port: upstreamPortOf(entry.upstream),
+    const upstream = upstreamRequest(entry, {
       method: request.method,
       path: request.url ?? '/',
       headers,
-      agent: false,
     })
     entry.requests.add(upstream)
     let timedOut = false
@@ -553,6 +584,13 @@ function writeUpstreamBody(entry: GatewayEntry, request: IncomingMessage, respon
   const status = upstreamResponse.statusCode ?? 200
   const decompressor = plan.decode === undefined ? undefined : createDecompressor(plan.decode)
   const coding = plan.coding !== undefined && (plan.decode === undefined || decompressor !== undefined) ? plan.coding : undefined
+  // 只 tee 已鉴权且允许缓存的静态响应；HTML/API/登录响应始终走原始链路。
+  const cachePath = request.method === 'GET' && plan.decode === undefined && coding === undefined && isCacheableResponse(status, upstreamResponse.headers)
+    ? cachePathOf(request.url ?? '/')
+    : undefined
+  if (cachePath !== undefined && entry.cacheHostId !== undefined && entry.cacheIdentity !== undefined) {
+    cacheBody(process.env.INKDSH_REMOTE_CACHE_DIR, entry.cacheHostId, entry.cacheIdentity, cachePath, upstreamResponse, response, headers)
+  }
   if (source !== 'loopback')
     appendVary(headers)
   if (coding === undefined) {
@@ -680,6 +718,7 @@ async function dispatchUpgrade(entry: GatewayEntry, request: IncomingMessage, so
   const inject = entry.kind !== 'outbound'
   const headers = forwardHeadersOf(request.headers, {
     authority: entry.authority,
+    scheme: entry.upstreamAuthority === true ? entry.upstream.protocol : undefined,
     upgrade: true,
     ...inject ? { source, session } : { source: 'public', session: 'outbound' },
     ...entry.kind === 'outbound' ? { identity: true } : {},
@@ -754,13 +793,10 @@ function upgradeHeadLines(entry: GatewayEntry, status: number, statusMessage: st
 }
 
 function openUpgrade(entry: GatewayEntry, request: IncomingMessage, socket: Duplex, head: Buffer, headers: OutgoingHttpHeaders, attempt: ForwardAttempt): void {
-  const upstream = httpRequest({
-    host: entry.upstream.hostname,
-    port: upstreamPortOf(entry.upstream),
+  const upstream = upstreamRequest(entry, {
     method: request.method,
     path: request.url ?? '/',
     headers,
-    agent: false,
   })
   entry.requests.add(upstream)
   let live = true
@@ -874,6 +910,18 @@ async function ensureMintedCookie(entry: GatewayEntry): Promise<string | undefin
 }
 
 async function mintCookie(entry: GatewayEntry): Promise<string | undefined> {
+  if (entry.cookieProvider !== undefined) {
+    try {
+      const cookie = await withTimeout(entry.cookieProvider())
+      if (cookie !== undefined)
+        mintedCookies.set(entry.authority, cookie)
+      return cookie
+    }
+    catch (error) {
+      emit(entry, 'cookie', `dsh-web-login 会话铸造失败，已透传上游响应：${messageOf(error)}`)
+      return undefined
+    }
+  }
   const provider = entry.tokenProvider
   if (provider === undefined)
     return undefined
@@ -900,23 +948,14 @@ async function mintCookie(entry: GatewayEntry): Promise<string | undefined> {
 }
 
 function requestMint(entry: GatewayEntry, mintUrl: string): Promise<string[]> {
+  const url = mintRequestUrlOf(mintUrl, entry.upstream, entry.authority)
+  if (url === undefined)
+    return Promise.resolve([])
   return new Promise((resolve) => {
-    let path: string
-    try {
-      const url = new URL(mintUrl)
-      path = `${url.pathname}${url.search}`
-    }
-    catch {
-      resolve([])
-      return
-    }
-    const request = httpRequest({
-      host: entry.upstream.hostname,
-      port: upstreamPortOf(entry.upstream),
+    const request = upstreamRequest(entry, {
       method: 'GET',
-      path,
+      path: `${url.pathname}${url.search}`,
       headers: { host: entry.authority, accept: 'text/html', connection: 'close' },
-      agent: false,
     })
     const timer = setTimeout(() => {
       request.destroy()

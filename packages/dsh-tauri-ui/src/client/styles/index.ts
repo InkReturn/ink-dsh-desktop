@@ -174,6 +174,9 @@ const TAILWINDCSS_GENERATED = `
   .mt-\\[8px\\] {
     margin-top: 8px;
   }
+  .mt-\\[10px\\] {
+    margin-top: 10px;
+  }
   .mt-\\[12px\\] {
     margin-top: 12px;
   }

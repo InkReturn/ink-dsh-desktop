@@ -33,11 +33,18 @@ export interface MachineRow {
   startCommand?: string
   color?: string
   tintBorder?: boolean
+  transport?: 'ssh' | 'direct'
+  directUrl?: string
+  hasAccessToken?: boolean
+  directAuthMethod?: 'password' | 'token'
+  loginUsername?: string
+  loginPath?: string
 }
 
 export interface SecretValues {
   password?: string
   passphrase?: string
+  accessToken?: string
 }
 
 export type ProgressPhase = 'handshake' | 'installing' | 'starting' | 'probing' | 'syncing'

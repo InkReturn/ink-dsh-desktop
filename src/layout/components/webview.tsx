@@ -33,18 +33,20 @@ const FULL_SIDEBAR_REVEAL_MS = 15_000
 export function Webview() {
   const [fullSidebarRevealed, setFullSidebarRevealed] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
-  const iframeRef = useRef<HTMLIFrameElement>(null)
+  const activeIframeRef = useRef<HTMLIFrameElement | null>(null)
   const pendingSettingsTabRef = useRef<string | null>(null)
-  const appearanceCss = useAppearance(iframeRef)
-  const post = useIframePost(iframeRef)
+  const appearanceCss = useAppearance(activeIframeRef)
+  const post = useIframePost(activeIframeRef)
 
   const [dshStyle] = useDshStyle()
   const [{ rows: shortcutRows }, setDshShortcuts] = useDshShortcuts()
 
   const { status, serviceHealthy, serviceRunning, iframeKey, iframeLoaded, iframeAlive, iframeError, startupPhase, busyAction } = useStore(store.harness)
   const { recovery } = useStore(store.recovery)
-  const [remoteView, setRemoteView] = useState({ url: '', tint: null as string | null })
+  const [remoteView, setRemoteView] = useState({ url: '', tint: null as string | null, id: '' })
+  const remoteFramesRef = useRef(new Map<string, { url: string }>())
   const activeTunnelUrl = remoteView.url
+  const activeRemoteId = remoteView.id
   const borderTint = remoteView.tint
   const remoteMode = activeTunnelUrl !== ''
   const live = status === 'ready' && (remoteMode || serviceHealthy)
@@ -86,8 +88,16 @@ export function Webview() {
   useListen('tauri://focus', syncViewMenu, { target: getCurrentWindow().label })
   useListen('macos-menu-rebuilt', syncViewMenu, { target: getCurrentWindow().label })
 
-  function handleRemoteChange(url: string, tint: string | null) {
-    setRemoteView({ url, tint })
+  function handleRemoteChange(url: string, tint: string | null, id: string | null = null) {
+    if (url !== '') {
+      const key = id || url
+      const frame = remoteFramesRef.current.get(key)
+      if (frame?.url !== url)
+        remoteFramesRef.current.set(key, { url })
+      setRemoteView({ url, tint, id: key })
+      return
+    }
+    setRemoteView({ url: '', tint: null, id: '' })
   }
 
   function openSettingsTab(tab: string) {
@@ -105,7 +115,7 @@ export function Webview() {
     openSettingsTab(tab)
   }
 
-  useIframeMessage<NavBridgeMessage>(iframeRef, (data) => {
+  useIframeMessage<NavBridgeMessage>(activeIframeRef, (data) => {
     if (data.type === 'dsh://sidebar:collapsed') {
       setSidebarCollapsed(Boolean(data.collapsed))
     }
@@ -139,11 +149,24 @@ export function Webview() {
         return <PreinstallSetup />
       case 'ready':
         return (
-          <Iframe
-            iframeRef={iframeRef}
-            srcOverride={remoteMode ? activeTunnelUrl : null}
-            borderTint={borderTint}
-          />
+          <div className="relative min-h-0 flex-1">
+            {!remoteMode && <Iframe iframeRef={activeIframeRef} />}
+            {remoteFramesRef.current.size > 0
+              ? [...remoteFramesRef.current.entries()].map(([key, frame]) => (
+                  <div
+                    key={key}
+                    className="absolute inset-0 flex flex-col"
+                    aria-hidden={remoteMode && key === activeRemoteId ? undefined : true}
+                    style={{
+                      visibility: remoteMode && key === activeRemoteId ? 'visible' : 'hidden',
+                      pointerEvents: remoteMode && key === activeRemoteId ? undefined : 'none',
+                    }}
+                  >
+                    <Iframe iframeRef={key === activeRemoteId ? activeIframeRef : { current: null }} srcOverride={frame.url} active={key === activeRemoteId} borderTint={key === activeRemoteId ? borderTint : null} />
+                  </div>
+                ))
+              : null}
+          </div>
         )
       default:
         return <Setup />

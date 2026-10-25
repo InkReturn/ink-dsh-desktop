@@ -16,8 +16,18 @@ export function machineProfileOf(raw: unknown): MachineProfile | undefined {
     return undefined
   if (typeof value.user !== 'string')
     return undefined
-  if (value.transport !== undefined && value.transport !== DEFAULT_MACHINE_TRANSPORT)
+  if (value.transport !== undefined && value.transport !== DEFAULT_MACHINE_TRANSPORT && value.transport !== 'direct')
     return undefined
+  if (value.transport === 'direct') {
+    try {
+      const url = new URL(String(value.directUrl ?? ''))
+      if (!['http:', 'https:'].includes(url.protocol) || url.origin !== String(value.directUrl).replace(/\/$/u, ''))
+        return undefined
+    }
+    catch {
+      return undefined
+    }
+  }
   // transport 是内存判别字段：文档里的取值只做校验，不回写 profile——否则下一次落盘
   // 会把缺省的 ssh 固化成显式字段，违背「缺省即 ssh 不写盘」的向后兼容约定。
   return {
@@ -28,6 +38,12 @@ export function machineProfileOf(raw: unknown): MachineProfile | undefined {
     user: value.user,
     remotePort: typeof value.remotePort === 'number' ? value.remotePort : DEFAULT_REMOTE_PORT,
     ...typeof value.password === 'string' && value.password !== '' ? { password: value.password } : {},
+    ...value.transport === 'direct' ? { transport: 'direct' as const } : {},
+    ...value.transport === 'direct' && typeof value.directUrl === 'string' ? { directUrl: value.directUrl } : {},
+    ...typeof value.accessToken === 'string' && value.accessToken !== '' ? { accessToken: value.accessToken } : {},
+    ...value.directAuthMethod === 'password' || value.directAuthMethod === 'token' ? { directAuthMethod: value.directAuthMethod } : {},
+    ...typeof value.loginUsername === 'string' && value.loginUsername !== '' ? { loginUsername: value.loginUsername } : {},
+    ...typeof value.loginPath === 'string' && value.loginPath.startsWith('/') && !value.loginPath.startsWith('/api') && !value.loginPath.includes('..') ? { loginPath: value.loginPath } : {},
     ...typeof value.passphrase === 'string' && value.passphrase !== '' ? { passphrase: value.passphrase } : {},
     ...typeof value.profileName === 'string' && value.profileName !== '' ? { profileName: value.profileName } : {},
     ...typeof value.startCommand === 'string' && value.startCommand !== '' ? { startCommand: value.startCommand } : {},

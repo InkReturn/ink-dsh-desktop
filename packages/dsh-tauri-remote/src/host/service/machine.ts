@@ -19,10 +19,12 @@ import { syncBundledPlugins } from '../utils/plugins-sync'
 import { discoverableHosts, loadSshConfigBlocks, lookupSshConfig, resolveSshAuth } from '../utils/ssh-config'
 import { bootstrap } from './bootstrap'
 import { assertRemoteDshVersion, checkMissingCommand, credentialsCopyCommand, describeExecFailure, ensurePnpmCommand, firstLineOf, missingComponentsOf, planRemoteInstall, readEnvCredentials, remoteWebTokenCommand, safeProfileName, skippedVerificationSummary } from './bootstrap.utils'
+import { connectDirect, directAuthMethodOf, directBaseUrl, isDirect, loginDirectCookie, probeDirect, validateDirectAuth } from './direct'
 import { events } from './events'
 import { gateway } from './gateway'
 import { knownHosts } from './known-hosts'
 import { fingerprintHostKey } from './known-hosts.utils'
+import { cancel as cancelPrefetch, start as startPrefetch } from './prefetch'
 import { state } from './state'
 
 const TUNNEL_PROBE_TIMEOUT_MS = 2_000
@@ -99,6 +101,7 @@ export const machine = defineService({
 
   status(machineId: MachineId): RemoteMachineStatus {
     const target = machineStates.get(machineId)
+    const profile = machineProfiles.get(machineId)
     const lastError = target?.lastError
     const progress = target?.progress
     const nextRetryAt = target?.reconnect?.nextRetryAt
@@ -107,6 +110,7 @@ export const machine = defineService({
       machineId,
       state: target?.phase ?? 'disconnected',
       ...target?.link !== undefined ? { tunnelBaseUrl: target.link.tunnelBaseUrl } : {},
+      ...target?.link !== undefined && profile !== undefined ? { cacheIdentity: cacheIdentityOf(profile) } : {},
       ...lastError === undefined ? {} : { lastError },
       ...target?.dshMissing === true ? { dshMissing: true } : {},
       ...progress === undefined ? {} : { progress },
@@ -121,6 +125,13 @@ export const machine = defineService({
 
   async test(machineId: MachineId, signal?: AbortSignal): Promise<RemoteTestResult> {
     const profile = requireProfile(machineId)
+    if (isDirect(profile)) {
+      const result = await probeDirect(profile, signal).then(
+        () => ({ ok: true as const, banner: profile.directUrl ?? '' }),
+        (error: unknown) => ({ ok: false as const, message: messageOf(error) }),
+      )
+      return result
+    }
     if (!transportCapabilities(profile).exec)
       return { ok: false, message: unsupportedCapabilityMessage(profile, 'exec') }
     const target = ensureState(machineId)
@@ -161,6 +172,8 @@ export const machine = defineService({
 
   async connect(machineId: MachineId, signal?: AbortSignal): Promise<RemoteLink> {
     const profile = requireProfile(machineId)
+    if (isDirect(profile))
+      return connectDirectHost(machineId, profile)
     requireCapabilities(machineId, profile, ['exec', 'stream'])
     const target = ensureState(machineId)
     if (target.link !== undefined)
@@ -200,6 +213,7 @@ export const machine = defineService({
   },
 
   async disconnect(machineId: MachineId): Promise<void> {
+    cancelPrefetch(machineId)
     const target = machineStates.get(machineId)
     if (target === undefined)
       return
@@ -249,6 +263,11 @@ export const machine = defineService({
   },
 
   async save(machineId: MachineId, row: MachineSaveRow, secrets?: MachineSecretWrite): Promise<void> {
+    if (row.transport === 'direct') {
+      const existing = machineTable.machines.get(machineId)
+      validateDirectAuth(row, secrets, existing)
+      await machine.disconnect(machineId)
+    }
     await state.save(buildProfile(machineId, row, secrets, machineTable.machines.get(machineId)))
     await machine.syncProfiles()
   },
@@ -274,7 +293,14 @@ function buildProfile(machineId: MachineId, row: MachineSaveRow, secrets: Machin
     user: row.user,
     remotePort: row.remotePort,
   }
-  if (existing !== undefined) {
+  if (row.transport === 'direct' && existing?.accessToken !== undefined) {
+    next.accessToken = existing.accessToken
+  }
+  if (row.transport === 'direct' && existing?.password !== undefined)
+    next.password = existing.password
+  if (row.transport !== 'direct' && existing !== undefined) {
+    if (existing.accessToken !== undefined)
+      next.accessToken = existing.accessToken
     if (existing.password !== undefined)
       next.password = existing.password
     if (existing.passphrase !== undefined)
@@ -288,7 +314,19 @@ function buildProfile(machineId: MachineId, row: MachineSaveRow, secrets: Machin
     next.color = row.color
   if (row.tintBorder === true)
     next.tintBorder = true
+  if (row.transport === 'direct') {
+    next.transport = 'direct'
+    next.directUrl = directBaseUrl(row.directUrl).origin
+    if (row.directAuthMethod !== undefined)
+      next.directAuthMethod = row.directAuthMethod
+    if (row.loginUsername !== undefined && row.loginUsername !== '')
+      next.loginUsername = row.loginUsername
+    if (row.loginPath !== undefined && row.loginPath !== '')
+      next.loginPath = row.loginPath
+  }
   if (secrets !== undefined) {
+    if (secrets.accessToken !== undefined && secrets.accessToken !== '')
+      next.accessToken = secrets.accessToken
     if (secrets.password !== undefined && secrets.password !== '')
       next.password = secrets.password
     if (secrets.passphrase !== undefined && secrets.passphrase !== '')
@@ -343,6 +381,8 @@ function requireProfile(machineId: MachineId): MachineProfile {
 }
 
 function transportCapabilities(profile: MachineProfile): RemoteTransportCapabilities {
+  if (isDirect(profile))
+    return { exec: false, stream: false }
   return machineRuntimeDeps().transport.resolve(profile).capabilities
 }
 
@@ -470,6 +510,7 @@ async function performConnect(machineId: MachineId, profile: MachineProfile, sig
         id: entryId,
         kind: 'outbound',
         upstream: `http://127.0.0.1:${tunnel.localPort}`,
+        cacheIdentity: `ssh://${profile.host}:${profile.remotePort}`,
         port: target.preferredGatewayPort ?? 0,
         tokenProvider: async (authority) => {
           const token = await readRemoteWebToken(session)
@@ -540,6 +581,7 @@ async function performConnect(machineId: MachineId, profile: MachineProfile, sig
         { terminal: 'success' },
       )
     }
+    startPrefetch({ machineId, gatewayUrl: link.tunnelBaseUrl, identity: cacheIdentityOf(profile) })
     return link
   }
   catch (error) {
@@ -563,6 +605,65 @@ async function performConnect(machineId: MachineId, profile: MachineProfile, sig
 
 function outboundEntryId(machineId: MachineId): string {
   return `remote-outbound:${machineId}`
+}
+
+/** 直连没有 SSH session/stream：仍复用 gateway 的鉴权、Cookie、WebSocket 与统一切换链路。 */
+async function connectDirectHost(machineId: MachineId, profile: MachineProfile): Promise<RemoteLink> {
+  const target = ensureState(machineId)
+  if (target.link !== undefined)
+    return target.link
+  if (target.connecting !== undefined)
+    return target.connecting
+  target.phase = 'connecting'
+  delete target.lastError
+  target.progress = { phase: 'probing' }
+  const generation = target.generation
+  emit(machineId)
+  const attempt = (async (): Promise<RemoteLink> => {
+    const cookie = directAuthMethodOf(profile) === 'password' ? await loginDirectCookie(profile) : undefined
+    const link = await connectDirect(machineId, profile, cookie)
+    if (generation !== target.generation) {
+      await gateway.stop(outboundEntryId(machineId)).catch(() => undefined)
+      throw new AttemptCancelled()
+    }
+    const entryId = outboundEntryId(machineId)
+    const unsubscribe = gateway.subscribe((event) => {
+      if (event.id !== entryId)
+        return
+      if (event.kind === 'cookie' || event.kind === 'compression')
+        events.append(machineId, 'reconnect', redacted(machineId, `网关转发异常：${event.line}`))
+      if (event.kind === 'stopped') {
+        const current = machineStates.get(machineId)
+        if (current?.phase !== 'disconnected')
+          detach(machineId, event.line)
+      }
+    })
+    target.gateway = { id: entryId, unsubscribe }
+    target.link = link
+    target.phase = 'connected'
+    delete target.progress
+    emit(machineId)
+    startPrefetch({ machineId, gatewayUrl: link.tunnelBaseUrl, identity: cacheIdentityOf(profile) })
+    return link
+  })()
+  target.connecting = attempt
+  try {
+    return await attempt
+  }
+  catch (error) {
+    if (error instanceof AttemptCancelled || generation !== target.generation)
+      throw error
+    const message = redacted(machineId, messageOf(error))
+    target.lastError = message
+    target.phase = 'disconnected'
+    delete target.progress
+    events.append(machineId, 'failed', message, { terminal: 'failed', reason: message })
+    emit(machineId)
+    throw error
+  }
+  finally {
+    delete target.connecting
+  }
 }
 
 async function cancelAttempt(entryId: string, tunnel: RemoteStreamHandle): Promise<void> {
@@ -652,6 +753,7 @@ function noteConnectFailure(machineId: MachineId, message: string): void {
 }
 
 function detach(machineId: MachineId, reason: string): void {
+  cancelPrefetch(machineId)
   const target = machineStates.get(machineId)
   if (target === undefined)
     return
@@ -739,7 +841,10 @@ async function attemptReconnect(machineId: MachineId, expected: ReconnectState):
   current.progress = { phase: 'handshake' }
   emit(machineId)
   try {
-    await performConnect(machineId, profile)
+    if (isDirect(profile))
+      await connectDirectHost(machineId, profile)
+    else
+      await performConnect(machineId, profile)
   }
   catch (error) {
     if (error instanceof AttemptCancelled)
@@ -758,6 +863,7 @@ async function attemptReconnect(machineId: MachineId, expected: ReconnectState):
 }
 
 function giveUp(machineId: MachineId, target: MachineState): void {
+  cancelPrefetch(machineId)
   const rec = target.reconnect
   stopReconnect(target)
   delete target.progress
@@ -791,7 +897,7 @@ function refuseWhileReconnecting(machineId: MachineId, target: MachineState): vo
 function redacted(machineId: MachineId, text: string): string {
   const profile = machineProfiles.get(machineId)
   let out = text
-  for (const secret of [profile?.password, profile?.passphrase]) {
+  for (const secret of [profile?.password, profile?.passphrase, profile?.accessToken]) {
     if (secret !== undefined && secret !== '')
       out = out.replaceAll(secret, '***')
   }
@@ -912,6 +1018,12 @@ function emit(machineId: MachineId): void {
   machineRuntimeDeps().emitStatus(machineId, machine.status(machineId))
 }
 
+function cacheIdentityOf(profile: MachineProfile): string {
+  return isDirect(profile)
+    ? directBaseUrl(profile.directUrl).origin
+    : `ssh://${profile.host}:${profile.remotePort}`
+}
+
 function profileView(profile: MachineProfile): MachineView {
   return {
     id: profile.id,
@@ -926,6 +1038,12 @@ function profileView(profile: MachineProfile): MachineView {
     ...profile.startCommand === undefined ? {} : { startCommand: profile.startCommand },
     ...profile.color === undefined ? {} : { color: profile.color },
     ...profile.tintBorder === true ? { tintBorder: true } : {},
+    ...profile.transport === 'direct' ? { transport: 'direct' } : {},
+    ...profile.directUrl === undefined ? {} : { directUrl: profile.directUrl },
+    ...profile.accessToken === undefined ? {} : { hasAccessToken: true },
+    ...profile.directAuthMethod === undefined ? {} : { directAuthMethod: profile.directAuthMethod },
+    ...profile.loginUsername === undefined ? {} : { loginUsername: profile.loginUsername },
+    ...profile.loginPath === undefined ? {} : { loginPath: profile.loginPath },
   }
 }
 

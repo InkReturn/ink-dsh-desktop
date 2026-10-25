@@ -1,6 +1,7 @@
 import type { GetApiTauriRemoteMachinesResponse } from '@/apis/remote.types'
 import { useEventListener, useUnmount, useWatch } from '@reause/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { useRef, useState } from 'react'
 import { getMachines, getMachinesEvents, postMachinesConnect, postMachinesDisconnect } from '@/apis/remote'
@@ -11,7 +12,7 @@ type RemoteConnectionState = NonNullable<RemoteMachineListItem['state']>
 type RemoteProgress = NonNullable<RemoteMachineListItem['progress']>
 type RemoteProgressPhase = RemoteProgress['phase']
 
-export type RemoteMachineRow = { id: string, name: string, state: RemoteConnectionState } & Pick<RemoteMachineListItem, 'color' | 'tintBorder' | 'host' | 'port' | 'user' | 'tunnelBaseUrl' | 'lastError' | 'nextRetryAt' | 'authMethod'> & { progress?: Pick<RemoteProgress, 'phase'> }
+export type RemoteMachineRow = { id: string, name: string, state: RemoteConnectionState, discovered?: boolean } & Pick<RemoteMachineListItem, 'color' | 'tintBorder' | 'host' | 'port' | 'user' | 'tunnelBaseUrl' | 'lastError' | 'nextRetryAt' | 'authMethod'> & { cacheIdentity?: string, progress?: Pick<RemoteProgress, 'phase'> }
 
 interface SwitcherTargets {
   activeId: string | null
@@ -35,6 +36,7 @@ function initialMachineId(): string | null {
 export function useRemote() {
   const queryClient = useQueryClient()
   const [targets, setTargets] = useState<SwitcherTargets>({ activeId: null, pendingId: null, activeTunnelUrl: '' })
+  const cacheBoundRef = useRef(false)
   const [bootId, setBootId] = useState(initialMachineId)
   const [connectTrail, setConnectTrail] = useState<RemoteProgressPhase[]>([])
   const [connectDismissed, setConnectDismissed] = useState(false)
@@ -56,6 +58,18 @@ export function useRemote() {
     refetchInterval: 2000,
   })
   const machines = machinesQuery.data?.enabled ? machinesQuery.data.machines : []
+  useWatch([targets.activeId, targets.activeTunnelUrl, machinesQuery.data], () => {
+    if (!('__TAURI_INTERNALS__' in window))
+      return
+    if (targets.activeId === null && !cacheBoundRef.current)
+      return
+    cacheBoundRef.current = targets.activeId !== null
+    invoke('bind_remote_frontend', {
+      hostId: targets.activeId ?? '',
+      gatewayUrl: targets.activeTunnelUrl,
+      identity: machines.find(machine => machine.id === targets.activeId)?.cacheIdentity ?? '',
+    }).catch(error => console.warn('[remote] static cache binding unavailable:', error))
+  }, { immediate: true })
   const available = !machinesQuery.isError
   const enabled = machinesQuery.data?.enabled === true
 
@@ -239,11 +253,11 @@ export function reconcileSwitcher(prev: SwitcherTargets, machines: readonly Remo
   else if (active.state === 'connected' && active.tunnelBaseUrl !== undefined) {
     activeTunnelUrl = active.tunnelBaseUrl
   }
-  const pending = machines.find(machine => machine.id === pendingId)
-  if (pending === undefined || pending.state === 'given-up') {
+  const pending = pendingId === null ? undefined : machines.find(machine => machine.id === pendingId)
+  if (pendingId !== null && (pending === undefined || pending.state === 'given-up')) {
     pendingId = null
   }
-  else if (pending.state === 'connected' && pending.tunnelBaseUrl !== undefined) {
+  else if (pending !== undefined && pending.state === 'connected' && pending.tunnelBaseUrl !== undefined) {
     activeId = pending.id
     activeTunnelUrl = pending.tunnelBaseUrl
     pendingId = null
@@ -252,8 +266,10 @@ export function reconcileSwitcher(prev: SwitcherTargets, machines: readonly Remo
 }
 
 export function machineRowsOf(value?: { enabled?: boolean, items?: readonly unknown[], discovered?: readonly unknown[] }): { enabled: boolean, machines: RemoteMachineRow[] } {
-  const machines = [...(value?.items ?? []), ...(value?.discovered ?? [])]
-    .map(machineRowOf)
+  const machines = [
+    ...(value?.items ?? []).map(machine => machineRowOf(machine, false)),
+    ...(value?.discovered ?? []).map(machine => machineRowOf(machine, true)),
+  ]
     .filter((row): row is RemoteMachineRow => row !== undefined)
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
   return { enabled: value?.enabled === true, machines }
@@ -270,7 +286,7 @@ export function eventEntriesOf(value?: { items?: readonly unknown[] }): { seq: n
   })
 }
 
-function machineRowOf(raw: unknown): RemoteMachineRow | undefined {
+function machineRowOf(raw: unknown, discovered = false): RemoteMachineRow | undefined {
   if (typeof raw !== 'object' || raw === null)
     return undefined
   const value = raw as Record<string, unknown>
@@ -287,7 +303,9 @@ function machineRowOf(raw: unknown): RemoteMachineRow | undefined {
     ...typeof value.port === 'number' ? { port: value.port } : {},
     ...typeof value.user === 'string' && value.user !== '' ? { user: value.user } : {},
     state: value.state as RemoteConnectionState,
+    ...discovered ? { discovered: true } : {},
     ...typeof value.tunnelBaseUrl === 'string' ? { tunnelBaseUrl: value.tunnelBaseUrl } : {},
+    ...typeof value.cacheIdentity === 'string' ? { cacheIdentity: value.cacheIdentity } : {},
     ...typeof value.lastError === 'string' ? { lastError: value.lastError } : {},
     ...typeof value.nextRetryAt === 'number' ? { nextRetryAt: value.nextRetryAt } : {},
     ...value.authMethod === 'agent' || value.authMethod === 'key' || value.authMethod === 'password' ? { authMethod: value.authMethod } : {},

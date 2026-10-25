@@ -1630,6 +1630,7 @@ pub fn handler() -> impl Fn(Invoke<Wry>) -> bool + Send + Sync + 'static {
         crate::bridge::update_local_core,
         crate::bridge::proxy_health_check,
         crate::desktop::frontend_preload::prepare_frontend_preload,
+        crate::desktop::frontend_preload::bind_remote_frontend,
         crate::bridge::harness_ownership,
         crate::bridge::get_runtime_info,
         crate::bridge::runtime_ready,

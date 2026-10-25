@@ -134,6 +134,33 @@ describe('machinesSection', () => {
     expect(within(screen.getByTestId('editor-10-1-1-1')).getByLabelText('Name')).toHaveProperty('value', 'newton')
   })
 
+  it('adds LAN and HTTPS direct hosts with write-only tokens', async () => {
+    mount()
+    await waitFor(() => expect(screen.getByText(/No SSH machines yet/)).toBeTruthy())
+    for (const [url, id, name, token] of [
+      ['http://192.168.31.83:3080/', '192-168-31-83-3080', 'LAN', 'lan-token'],
+      ['https://dshs.inkmo.top/', 'dshs-inkmo-top', 'Inkmo', 'https-token'],
+    ] as const) {
+      fireEvent.click(screen.getByText('Add machine'))
+      const dialog = within(screen.getByRole('dialog', { name: 'Add machine' }))
+      fireEvent.click(dialog.getByText('Direct URL'))
+      fireEvent.click(dialog.getByText('Access token'))
+      fireEvent.change(dialog.getByLabelText('dsh Web URL'), { target: { value: url } })
+      fireEvent.change(dialog.getByLabelText('Name'), { target: { value: name } })
+      fireEvent.change(dialog.getByLabelText('Access token'), { target: { value: token } })
+      expect(dialog.queryByLabelText('Host or config alias')).toBeNull()
+      once(replies.ok({}))
+      once(replies.ok({ items: [] }))
+      fireEvent.click(dialog.getByText('Add & save'))
+      await waitFor(() => expect(savePayloads()).toHaveLength(url.startsWith('https') ? 2 : 1))
+      const payload = savePayloads().at(-1)
+      expect(payload?.machineId).toBe(id)
+      expect(payload?.row).toMatchObject({ transport: 'direct', directUrl: url.replace(/\/$/u, '') })
+      expect(payload?.secrets).toEqual({ accessToken: token })
+      expect(JSON.stringify(payload?.row)).not.toContain(token)
+    }
+  })
+
   it('derives a unique auto id and validates taken ids inline', async () => {
     mount({ value: { items: [{ ...machineA, state: 'disconnected' }] } })
     await waitFor(() => expect(screen.getByText('alpha')).toBeTruthy())

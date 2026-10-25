@@ -28,19 +28,20 @@ function stateTextOf(
 }
 
 export function RemoteSwitcher({ onChange, visible = true, onManage, onSync }: {
-  onChange: (url: string, tint: string | null) => void
+  onChange: (url: string, tint: string | null, hostId: string | null) => void
   visible?: boolean
   onManage?: () => void
   onSync?: () => void
 }) {
   const { t } = useTranslation()
   const remote = useRemote()
-  const { machines, activeId, activeTunnelUrl, available, enabled, pendingId } = remote
+  const { machines: allMachines, activeId, activeTunnelUrl, available, enabled, pendingId } = remote
+  const machines = allMachines.filter(machine => machine.discovered !== true)
 
   const activeMachine = machines.find(machine => machine.id === activeId)
   const activeColor = activeMachine?.color
   const tint = activeTunnelUrl !== '' && activeMachine?.tintBorder ? activeColor ?? null : null
-  useWatch([activeTunnelUrl, tint], () => onChange(activeTunnelUrl, tint), { immediate: true })
+  useWatch([activeTunnelUrl, tint, activeId], () => onChange(activeTunnelUrl, tint, activeId), { immediate: true })
 
   function handleOpenWindowError(err: unknown) {
     toast(t('remote.open_window_failed'), {})

@@ -5,7 +5,7 @@ import { pipeline } from 'node:stream/promises'
 import * as zlib from 'node:zlib'
 import { describe, expect, it } from 'vitest'
 import { GATEWAY_SESSION_HEADER, GATEWAY_SOURCE_HEADER } from '../config/constants'
-import { acceptsEncoding, authorityFor, cookiePairsOf, createCompressor, createDecompressor, entryUrlOf, forwardHeadersOf, isCompressible, isCrossSiteRequest, isEventStream, isNavigationRequest, isReplayable, isUpgradeOf, loginPageHtml, mergeCookieHeader, negotiateEncoding, parseCookieHeader, parseFormField, responseHeadersOf, responsePlanOf, supportsZstd, tunnelClientIpOf, upstreamPortOf } from './gateway.utils'
+import { acceptsEncoding, authorityFor, cookiePairsOf, createCompressor, createDecompressor, entryUrlOf, forwardHeadersOf, isCompressible, isCrossSiteRequest, isEventStream, isNavigationRequest, isReplayable, isUpgradeOf, loginPageHtml, mergeCookieHeader, mintRequestUrlOf, negotiateEncoding, parseCookieHeader, parseFormField, responseHeadersOf, responsePlanOf, supportsZstd, tunnelClientIpOf, upstreamPortOf } from './gateway.utils'
 
 const SESSION = 'gateway-session-token'
 
@@ -45,9 +45,34 @@ describe('entryUrlOf / upstreamPortOf', () => {
     expect(entryUrlOf('fd00::1', 3088)).toBe('http://[fd00::1]:3088')
   })
 
-  it('defaults an upstream URL without an explicit port to 80', () => {
+  it('defaults HTTP and HTTPS upstream URLs to their protocol ports', () => {
     expect(upstreamPortOf(new URL('http://127.0.0.1:39001'))).toBe(39001)
     expect(upstreamPortOf(new URL('http://127.0.0.1'))).toBe(80)
+    expect(upstreamPortOf(new URL('https://dshs.test'))).toBe(443)
+    expect(upstreamPortOf(new URL('https://dshs.test:8443'))).toBe(8443)
+    expect(upstreamPortOf(new URL('https://dshs.test:443'))).toBe(443)
+  })
+})
+
+describe('mintRequestUrlOf', () => {
+  it('accepts a complete direct upstream token URL and a legacy loopback authority URL', () => {
+    const upstream = new URL('https://dshs.test:8443/')
+    expect(mintRequestUrlOf('https://dshs.test:8443/?token=one', upstream)?.toString()).toBe('https://dshs.test:8443/?token=one')
+    expect(mintRequestUrlOf('http://127.0.0.1:3088/?token=two', upstream, '127.0.0.1:3088')?.toString()).toBe('https://dshs.test:8443/?token=two')
+    expect(mintRequestUrlOf('http://127.0.0.1:3088/?token=wrong', upstream, '127.0.0.1:9999')).toBeUndefined()
+    expect(mintRequestUrlOf('http://other.test/?token=wrong', upstream)).toBeUndefined()
+    expect(mintRequestUrlOf('/?token=three', upstream)?.toString()).toBeUndefined()
+  })
+
+  it.each([
+    'https://other.test/?token=secret',
+    'http://dshs.test:8443/?token=secret',
+    'file:///tmp/?token=secret',
+    'https://dshs.test:8443/mint?token=secret',
+    'https://dshs.test:8443/?token=secret#fragment',
+    'not a URL',
+  ])('rejects a token URL outside the upstream root: %s', (value) => {
+    expect(mintRequestUrlOf(value, new URL('https://dshs.test:8443/'))).toBeUndefined()
   })
 })
 

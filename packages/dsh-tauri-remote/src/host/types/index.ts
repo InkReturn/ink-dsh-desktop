@@ -9,7 +9,10 @@ export function MachineId(id: string): MachineId {
   return id as MachineId
 }
 
-export type MachineTransport = 'ssh'
+export type MachineTransport = 'ssh' | 'direct'
+
+/** 直连 Host 的可选登录方式；密码仍由远端 dsh-web-login 插件校验。 */
+export type DirectAuthMethod = 'password' | 'token'
 
 export interface MachineProfile {
   id: MachineId
@@ -25,6 +28,15 @@ export interface MachineProfile {
   color?: string
   tintBorder?: boolean
   transport?: MachineTransport
+  /** 直连 dsh Web 的 URL；仅 transport=direct 使用。 */
+  directUrl?: string
+  /** DSH 启动访问令牌，仅用于 gateway 换会话 Cookie，不向前端返回。 */
+  accessToken?: string
+  /** 密码登录走 dsh-web-login；不填时按是否有 accessToken 兼容旧配置。 */
+  directAuthMethod?: DirectAuthMethod
+  /** dsh-web-login 可选用户名与登录路由（默认 /__login）。 */
+  loginUsername?: string
+  loginPath?: string
 }
 
 export interface MachineView {
@@ -40,6 +52,12 @@ export interface MachineView {
   startCommand?: string
   color?: string
   tintBorder?: boolean
+  transport?: MachineTransport
+  directUrl?: string
+  hasAccessToken?: boolean
+  directAuthMethod?: DirectAuthMethod
+  loginUsername?: string
+  loginPath?: string
 }
 
 export interface MachineSaveRow {
@@ -52,11 +70,17 @@ export interface MachineSaveRow {
   startCommand?: string
   color?: string
   tintBorder?: boolean
+  transport?: MachineTransport
+  directUrl?: string
+  directAuthMethod?: DirectAuthMethod
+  loginUsername?: string
+  loginPath?: string
 }
 
 export interface MachineSecretWrite {
   password?: string
   passphrase?: string
+  accessToken?: string
 }
 
 export type RemoteConnectionState
@@ -83,6 +107,7 @@ export interface RemoteMachineStatus {
   machineId: MachineId
   state: RemoteConnectionState
   tunnelBaseUrl?: string
+  cacheIdentity?: string
   lastError?: string
   dshMissing?: boolean
   progress?: RemoteProgress
@@ -318,6 +343,14 @@ export interface RemoteGatewayStartOptions {
   auth?: () => RemoteAuthPolicy
   /** 隧道腿的对外主机名（`host[:port]`）：同源判定在 cloudflared 改写 Host 后只能靠它对 Origin / Referer。 */
   publicHost?: () => string | undefined
+  /** 直连 dsh-web-login 的 Cookie 绑定远端 authority；SSH 仍使用本地 gateway authority。 */
+  upstreamAuthority?: boolean
+  /** 静态缓存身份：直连为 web origin，SSH 为不含凭据的主机/远端端口指纹。 */
+  cacheIdentity?: string
+  /** 可选：通过 dsh-web-login 用密码兑换会话 Cookie；凭证只在 provider 内闭包使用。 */
+  cookieProvider?: () => Promise<string | undefined>
+  /** 已在连接阶段通过 dsh-web-login 换取的会话 Cookie；优先于再次提交密码。 */
+  initialCookie?: string
 }
 
 export interface RemoteExecOptions {

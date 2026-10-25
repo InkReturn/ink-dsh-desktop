@@ -21,6 +21,7 @@ export function listItemOf(view: MachineView, status: RemoteMachineStatus): Remo
     ...view,
     state: status.state,
     ...status.tunnelBaseUrl === undefined ? {} : { tunnelBaseUrl: status.tunnelBaseUrl },
+    ...status.cacheIdentity === undefined ? {} : { cacheIdentity: status.cacheIdentity },
     ...status.lastError === undefined ? {} : { lastError: status.lastError },
     ...status.dshMissing === true ? { dshMissing: true } : {},
     ...status.progress === undefined ? {} : { progress: status.progress },
@@ -60,7 +61,7 @@ export function saveRowOf(value: { row?: unknown }): MachineSaveRow {
     throw new Error('invalid row: name')
   if (typeof fields.host !== 'string' || fields.host === '')
     throw new Error('invalid row: host')
-  if (typeof fields.user !== 'string')
+  if (typeof fields.user !== 'string' && fields.transport !== 'direct')
     throw new Error('invalid row: user')
   const port = typeof fields.port === 'number' ? fields.port : DEFAULT_SSH_PORT
   const remotePort = typeof fields.remotePort === 'number' ? fields.remotePort : DEFAULT_REMOTE_PORT
@@ -74,8 +75,13 @@ export function saveRowOf(value: { row?: unknown }): MachineSaveRow {
     name: fields.name,
     host: fields.host,
     port,
-    user: fields.user,
+    user: typeof fields.user === 'string' ? fields.user : '',
     remotePort,
+    ...fields.transport === 'direct' ? { transport: 'direct' as const } : {},
+    ...fields.transport === 'direct' && typeof fields.directUrl === 'string' ? { directUrl: fields.directUrl } : {},
+    ...fields.transport === 'direct' && (fields.directAuthMethod === 'password' || fields.directAuthMethod === 'token') ? { directAuthMethod: fields.directAuthMethod } : {},
+    ...fields.transport === 'direct' && typeof fields.loginUsername === 'string' ? { loginUsername: fields.loginUsername } : {},
+    ...fields.transport === 'direct' && typeof fields.loginPath === 'string' ? { loginPath: fields.loginPath } : {},
     ...profileName === undefined ? {} : { profileName },
     ...startCommand === undefined ? {} : { startCommand },
     ...color === undefined ? {} : { color },
@@ -95,6 +101,8 @@ export function secretsOf(value: { secrets?: unknown }): MachineSecretWrite | un
     out.password = fields.password
   if (typeof fields.passphrase === 'string' && fields.passphrase !== '')
     out.passphrase = fields.passphrase
+  if (typeof fields.accessToken === 'string' && fields.accessToken !== '')
+    out.accessToken = fields.accessToken
   return out
 }
 

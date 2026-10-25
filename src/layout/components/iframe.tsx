@@ -14,7 +14,7 @@ import { useOverlay } from '@overlastic/react'
 import { useEventListener, useTimeoutFn, useUnmountedRef, useWatch } from '@reause/core'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { If } from 'react-if-lite'
 import { useStore } from 'valtio-define'
@@ -36,6 +36,9 @@ import { Loadable } from './loadable'
 
 /** 启动期外观握手兜底：帧内接收器异常时也不让 iframe 永久藏住（远超正常握手耗时）。 */
 const APPEARANCE_HANDSHAKE_TIMEOUT = 4000
+
+/** 远端首帧兜底：慢链路或 onLoad 丢失时不能让「正在加载远端」永久盖住页面。 */
+const REMOTE_LOAD_REVEAL_TIMEOUT = 20_000
 
 /** 可见性兜底轮询间隔：主路径是窗口 focus/resize 事件，5s 足以覆盖任务栏切换等场景 */
 
@@ -221,7 +224,7 @@ async function loadNotificationSounds(): Promise<Record<string, string>> {
   return notificationSoundAssets
 }
 
-export function Iframe({ iframeRef, srcOverride = null, borderTint = null }: IframeProps) {
+export function Iframe({ iframeRef, srcOverride = null, borderTint = null, active = true }: IframeProps & { active?: boolean }) {
   const { t } = useTranslation()
   const openConfigDialog = useOverlay(ConfigDialog)
   const harness = useStore(store.harness)
@@ -232,7 +235,14 @@ export function Iframe({ iframeRef, srcOverride = null, borderTint = null }: Ifr
   // 记录落定收起（无 effect、无额外渲染轮次）。
   const remoteMode = srcOverride !== null && srcOverride !== ''
   const [loadedUrl, setLoadedUrl] = useState('')
-  const remoteLoading = remoteMode && loadedUrl !== srcOverride
+  const [remoteTimedOutUrl, setRemoteTimedOutUrl] = useState<string | null>(null)
+  useEffect(() => {
+    if (!remoteMode || loadedUrl === srcOverride || remoteTimedOutUrl === srcOverride)
+      return
+    const timer = window.setTimeout(setRemoteTimedOutUrl, REMOTE_LOAD_REVEAL_TIMEOUT, srcOverride)
+    return () => window.clearTimeout(timer)
+  }, [remoteMode, srcOverride, loadedUrl, remoteTimedOutUrl])
+  const remoteLoading = remoteMode && active && loadedUrl !== srcOverride && remoteTimedOutUrl !== srcOverride
   const preloadKey = `${harness.frontendGeneration}#${harness.iframeKey}#${harness.serviceUrl}`
   const [preload, setPreload] = useState<{ key: string, src: string, id: string, waiting: boolean, applied: boolean } | null>(null)
   const [preloadFailed, setPreloadFailed] = useState('')
@@ -400,6 +410,10 @@ export function Iframe({ iframeRef, srcOverride = null, borderTint = null }: Ifr
     // 能走到这里说明帧内确实跑着 dsh 页面（来源与 origin 已由 hook 校验过），
     // 与具体桥无关——据此确认 iframe 不是一张浏览器内部错误页（issue #705）。
     store.harness.markIframeAlive()
+    // 远端页面可能因挂起的外部图片/长连接永不触发 iframe onLoad；插件 boot 完成
+    // 才是壳层该揭开遮罩的时刻。
+    if (remoteMode && data.type === 'dsh://plugin-boot:ready')
+      setLoadedUrl(srcOverride)
     switch (data.type) {
       case 'dsh://desktop-settings:open':
         void openConfigDialog({ tab: 'application' }).catch((error: unknown) => {
@@ -722,7 +736,7 @@ export function Iframe({ iframeRef, srcOverride = null, borderTint = null }: Ifr
   }
 
   return (
-    <div className="relative min-h-0 flex-1">
+    <div className="relative h-full min-h-0 flex-1">
       <If
         cond={mounted}
         else={<Loadable subtitle={t(harness.startupStatusKey)} />}

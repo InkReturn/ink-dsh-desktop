@@ -6,7 +6,7 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { createElement, StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { queryKeys } from '@/config/query-keys'
-import { useRemote } from './use-remote'
+import { useRemote, reconcileSwitcher } from './use-remote'
 
 const { invoke, windowInfo } = vi.hoisted(() => ({ invoke: vi.fn(), windowInfo: { label: 'main' } }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke }))
@@ -57,6 +57,8 @@ beforeEach(() => {
     return { tunnelBaseUrl: 'http://127.0.0.1:4001' }
   })
   invoke.mockReset().mockImplementation(async (command: string, args: { method: string, payload: { machineId: string, sinceSeq?: number } }) => {
+    if (command === 'bind_remote_frontend')
+      return null
     expect(command).toBe('remote')
     switch (args.method) {
       case 'GET /api/tauri/remote/machines':
@@ -155,7 +157,7 @@ describe('useRemote 查询、降级与启动寻址', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(4000)
     })
-    expect(invoke.mock.calls.filter(call => call[1].method.endsWith('/machines'))).toHaveLength(4)
+    expect(invoke.mock.calls.filter(call => call[0] === 'remote' && call[1].method.endsWith('/machines'))).toHaveLength(4)
   })
 
   it('重新可见时由 React Query 刷新并恢复可用状态', async () => {
@@ -170,7 +172,7 @@ describe('useRemote 查询、降级与启动寻址', () => {
     act(() => document.dispatchEvent(new Event('visibilitychange', { bubbles: true })))
     await waitFor(() => expect(result.current.available).toBe(true))
     expect(result.current.machines.map(row => row.name)).toEqual(['alpha'])
-    expect(invoke.mock.calls.filter(call => call[1].method.endsWith('/machines'))).toHaveLength(2)
+    expect(invoke.mock.calls.filter(call => call[0] === 'remote' && call[1].method.endsWith('/machines'))).toHaveLength(2)
   })
 
   it.each(['remote-776562--m1', 'remote-7461757269--m1'])('profile-scoped window %s reads its explicit machine target', async (label) => {
@@ -229,6 +231,35 @@ describe('useRemote 查询、降级与启动寻址', () => {
 })
 
 describe('useRemote 切换和连接进度', () => {
+  it('后台已连接的其它 Host 不抢当前 Host 的切换', () => {
+    const result = reconcileSwitcher(
+      { activeId: 'lan', pendingId: null, activeTunnelUrl: 'http://127.0.0.1:4001' },
+      [
+        machineOf({ id: 'lan', name: 'lan', state: 'connected', tunnelBaseUrl: 'http://127.0.0.1:4001' }),
+        machineOf({ id: 'inkmo', name: 'inkmo', state: 'connected', tunnelBaseUrl: 'http://127.0.0.1:4002' }),
+      ],
+    )
+    expect(result).toEqual({ activeId: 'lan', pendingId: null, activeTunnelUrl: 'http://127.0.0.1:4001' })
+  })
+
+  it('a→b→a 绑定各自的缓存身份，回本地才解绑', async () => {
+    rows = [
+      machineOf({ id: 'lan', name: 'LAN', state: 'connected', tunnelBaseUrl: 'http://127.0.0.1:4001', cacheIdentity: 'http://192.168.31.83:3080' }),
+      machineOf({ id: 'inkmo', name: 'Inkmo', state: 'connected', tunnelBaseUrl: 'http://127.0.0.1:4002', cacheIdentity: 'https://dshs.inkmo.top' }),
+    ]
+    const { result } = await ready()
+    const bindings = () => invoke.mock.calls.filter(call => call[0] === 'bind_remote_frontend').map(call => call[1])
+    expect(bindings()).toHaveLength(0)
+    act(() => result.current.switchTo('lan'))
+    await waitFor(() => expect(bindings().at(-1)).toEqual({ hostId: 'lan', gatewayUrl: 'http://127.0.0.1:4001', identity: 'http://192.168.31.83:3080' }))
+    act(() => result.current.switchTo('inkmo'))
+    await waitFor(() => expect(bindings().at(-1)).toEqual({ hostId: 'inkmo', gatewayUrl: 'http://127.0.0.1:4002', identity: 'https://dshs.inkmo.top' }))
+    act(() => result.current.switchTo('lan'))
+    await waitFor(() => expect(bindings().at(-1)).toEqual({ hostId: 'lan', gatewayUrl: 'http://127.0.0.1:4001', identity: 'http://192.168.31.83:3080' }))
+    act(() => result.current.backToLocal())
+    await waitFor(() => expect(bindings().at(-1)).toEqual({ hostId: '', gatewayUrl: '', identity: '' }))
+  })
+
   it('已连接目标立即切换，不调用 connect', async () => {
     rows = [machineOf({ state: 'connected', tunnelBaseUrl: 'http://127.0.0.1:4001' })]
     const { result } = await ready()

@@ -1,7 +1,9 @@
-import type { IncomingHttpHeaders, OutgoingHttpHeaders } from 'node:http'
+import type { ClientRequest, IncomingHttpHeaders, OutgoingHttpHeaders, RequestOptions } from 'node:http'
 import type { Transform } from 'node:stream'
 import type { RemoteGatewayEntryKind } from '../types/index'
 import type { RemoteForwardPlan, RemoteResponsePlan, RemoteResponsePlanInput } from './gateway.types'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import * as zlib from 'node:zlib'
 import { GATEWAY_SESSION_HEADER, GATEWAY_SOURCE_HEADER } from '../config/constants'
 import { classifyPeer, isIpAddress } from '../utils/source'
@@ -40,7 +42,50 @@ export function entryUrlOf(host: string, port: number): string {
 }
 
 export function upstreamPortOf(upstream: URL): number {
-  return upstream.port === '' ? 80 : Number(upstream.port)
+  if (upstream.port !== '')
+    return Number(upstream.port)
+  return upstream.protocol === 'https:' ? 443 : 80
+}
+
+export function upstreamRequest(entry: { kind: RemoteGatewayEntryKind, upstream: URL, upstreamAuthority?: boolean }, options: RequestOptions): ClientRequest {
+  const secure = entry.upstream.protocol === 'https:'
+  const hostname = entry.upstream.hostname.startsWith('[') ? entry.upstream.hostname.slice(1, -1) : entry.upstream.hostname
+  const send = secure ? httpsRequest : httpRequest
+  const headers = options.headers as OutgoingHttpHeaders | undefined
+  const hasOrigin = headers !== undefined && headers.origin !== undefined
+  return send({
+    ...options,
+    host: hostname,
+    port: upstreamPortOf(entry.upstream),
+    ...secure ? { servername: isIpAddress(hostname) ? undefined : hostname, secure: true } : {},
+    ...entry.kind === 'outbound' && (secure || entry.upstreamAuthority === true)
+      ? {
+          headers: {
+            ...options.headers,
+            host: entry.upstream.host,
+            ...hasOrigin ? { origin: entry.upstream.origin } : {},
+          },
+        }
+      : {},
+    agent: false,
+  })
+}
+
+export function mintRequestUrlOf(mintUrl: string, upstream: URL, authority?: string): URL | undefined {
+  try {
+    const url = new URL(mintUrl)
+    const legacy = url.protocol === 'http:' && authority?.includes(':') === true && url.host === authority
+    if ((!legacy && url.origin !== upstream.origin) || (url.protocol !== 'http:' && url.protocol !== 'https:') || url.pathname !== '/' || url.hash !== '')
+      return undefined
+    url.protocol = upstream.protocol
+    url.username = ''
+    url.password = ''
+    url.host = upstream.host
+    return url
+  }
+  catch {
+    return undefined
+  }
 }
 
 /**
@@ -60,7 +105,7 @@ export function forwardHeadersOf(headers: IncomingHttpHeaders, plan: RemoteForwa
     if (value === undefined)
       continue
     const lower = name.toLowerCase()
-    if (lower === GATEWAY_SOURCE_HEADER || lower === GATEWAY_SESSION_HEADER || lower === 'host' || lower === 'origin')
+    if (lower === GATEWAY_SOURCE_HEADER || lower === GATEWAY_SESSION_HEADER || lower === 'x-inkdsh-prefetch' || lower === 'host' || lower === 'origin')
       continue
     if (!passthroughHopByHop && HOP_BY_HOP.has(lower))
       continue
@@ -71,7 +116,7 @@ export function forwardHeadersOf(headers: IncomingHttpHeaders, plan: RemoteForwa
   out.host = plan.authority
   const origin = headers.origin
   if (typeof origin === 'string' && origin !== '')
-    out.origin = `http://${plan.authority}`
+    out.origin = `${plan.scheme ?? 'http:'}//${plan.authority}`
   if (plan.source !== undefined && plan.session !== undefined && plan.session !== '') {
     out[GATEWAY_SOURCE_HEADER] = plan.source
     out[GATEWAY_SESSION_HEADER] = plan.session

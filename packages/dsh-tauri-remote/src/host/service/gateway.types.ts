@@ -5,6 +5,8 @@ export type RemoteContentCoding = 'zstd' | 'gzip'
 /** 转发请求的改写与注入计划：authority 对齐 + 内部来源标识 + 出站腿的 identity 声明。 */
 export interface RemoteForwardPlan {
   authority: string
+  /** 直连按远端 scheme 重建 Origin，防止把公网 HTTPS 误写成回环 HTTP。 */
+  scheme?: string
   source?: RemoteSourceClass
   session?: string
   identity?: boolean

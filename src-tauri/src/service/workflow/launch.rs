@@ -907,6 +907,12 @@ pub(super) async fn launch_prepared(
     envs.insert("DSH_TELEMETRY_DISABLED".to_string(), "1".to_string());
     envs.insert("NO_COLOR".to_string(), "1".to_string());
     envs.insert("DSH_WEB_PORT".to_string(), setting.port.to_string());
+    // P3b：remote gateway 在已鉴权的上游响应流上写静态资源缓存。桌面壳仅从该
+    // 目录读取命中；环境缺失时整个缓存功能关闭，绝不影响原有远程链路。
+    envs.insert(
+        "INKDSH_REMOTE_CACHE_DIR".to_string(),
+        base.join("inkdsh/remote-cache").to_string_lossy().into_owned(),
+    );
     // 把服务实际使用的 node 路径显式交给子进程（pnpm/dsh shim 的 DSH_NODE
     // 优先）：市场（dsh-market）等子进程经 PATH 解析 node 可能与桌面端预检
     // 不一致（相对 PATH 条目 / junction / 子进程 PATH 布局差异），导致 pnpm

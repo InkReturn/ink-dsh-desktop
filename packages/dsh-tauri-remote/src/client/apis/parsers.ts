@@ -112,7 +112,7 @@ function machineRowOf(value: unknown): MachineRow | undefined {
     return undefined
   const id = textOf(value.id)
   const host = textOf(value.host)
-  if (id === undefined || typeof value.name !== 'string' || host === undefined || typeof value.user !== 'string')
+  if (id === undefined || typeof value.name !== 'string' || host === undefined || (typeof value.user !== 'string' && value.transport !== 'direct'))
     return undefined
   const profileName = typeof value.profileName === 'string' ? value.profileName.trim() : ''
   const startCommand = textOf(value.startCommand)
@@ -122,14 +122,21 @@ function machineRowOf(value: unknown): MachineRow | undefined {
     name: value.name,
     host,
     port: numberOf(value.port) ?? DEFAULT_SSH_PORT,
-    user: value.user,
+    user: typeof value.user === 'string' ? value.user : '',
     hasPassword: value.hasPassword === true,
     hasPassphrase: value.hasPassphrase === true,
+    ...value.hasAccessToken === true ? { hasAccessToken: true } : {},
+    ...value.transport === 'direct' ? { transport: 'direct' as const } : {},
+    ...typeof value.directUrl === 'string' ? { directUrl: value.directUrl } : {},
+    ...value.directAuthMethod === 'password' || value.directAuthMethod === 'token' ? { directAuthMethod: value.directAuthMethod } : {},
+    ...typeof value.loginUsername === 'string' ? { loginUsername: value.loginUsername } : {},
+    ...typeof value.loginPath === 'string' ? { loginPath: value.loginPath } : {},
     remotePort: numberOf(value.remotePort) ?? DEFAULT_REMOTE_PORT,
     ...PROFILE_NAME.test(profileName) ? { profileName } : {},
     ...startCommand === undefined ? {} : { startCommand },
     ...color === undefined ? {} : { color },
     ...value.tintBorder === true ? { tintBorder: true } : {},
+    ...typeof value.cacheIdentity === 'string' ? { cacheIdentity: value.cacheIdentity } : {},
   }
 }
 
@@ -205,6 +212,9 @@ export function savePayloadOf(machine: MachineRow, secrets: SecretValues): PostA
   const password = textOf(secrets.password)
   if (password !== undefined)
     typed.password = password
+  const accessToken = textOf(secrets.accessToken)
+  if (accessToken !== undefined)
+    typed.accessToken = accessToken
   const passphrase = textOf(secrets.passphrase)
   if (passphrase !== undefined)
     typed.passphrase = passphrase
@@ -220,6 +230,11 @@ export function savePayloadOf(machine: MachineRow, secrets: SecretValues): PostA
       ...startCommand === undefined ? {} : { startCommand },
       ...color === undefined ? {} : { color },
       ...machine.tintBorder === true ? { tintBorder: true } : {},
+      ...machine.transport === 'direct' ? { transport: 'direct' as const } : {},
+      ...machine.directUrl === undefined ? {} : { directUrl: machine.directUrl },
+      ...machine.directAuthMethod === undefined ? {} : { directAuthMethod: machine.directAuthMethod },
+      ...machine.loginUsername === undefined ? {} : { loginUsername: machine.loginUsername },
+      ...machine.loginPath === undefined ? {} : { loginPath: machine.loginPath },
     },
     ...Object.keys(typed).length === 0 ? {} : { secrets: typed },
   }

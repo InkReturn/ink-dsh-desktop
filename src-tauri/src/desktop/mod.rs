@@ -6,6 +6,7 @@ pub mod compat;
 pub mod deep_link;
 pub mod frame_log;
 pub(crate) mod frontend_preload;
+pub(crate) mod remote_cache;
 #[cfg(unix)]
 pub mod login_path;
 pub mod notification;

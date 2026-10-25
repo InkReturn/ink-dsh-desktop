@@ -33,7 +33,7 @@ interface Draft {
 
 type DirtySecrets = Record<string, SecretValues>
 
-type SecretFieldName = 'password' | 'passphrase'
+type SecretFieldName = 'password' | 'passphrase' | 'accessToken'
 
 interface MachinesSectionProps {
   t: (key: RemoteKey) => string
@@ -119,53 +119,99 @@ function EditPanel({ draft, t, hasPassword, hasPassphrase, dirty, saving, onChan
   const invalid = row.id === '' || row.name === '' || row.host === ''
   return (
     <div className="mx-0 mb-[4px] mt-[2px] flex flex-col gap-[12px] border-t border-t-border-l2 pt-[12px]" data-testid={`editor-${row.id}`}>
-      <div className="grid grid-cols-[repeat(12,minmax(0,1fr))] gap-[10px_12px] max-[760px]:grid-cols-[repeat(6,minmax(0,1fr))]">
-        <Field label={t('field.id')} span={3}>
-          <Input className="box-border w-full" value={row.id} disabled />
-        </Field>
-        <Field label={t('field.name')} span={4}>
-          <Input className="box-border w-full" value={row.name} disabled={saving} onChange={event => onChange(draft.key, { name: event.target.value })} />
-        </Field>
-        <Field label={t('field.host')} span={5}>
-          <Input className="box-border w-full" value={row.host} disabled={saving} onChange={event => onChange(draft.key, { host: event.target.value })} />
-        </Field>
-        <Field label={t('field.port')} span={3}>
-          <Input className="box-border w-full" type="number" value={row.port} disabled={saving} onChange={event => onChange(draft.key, { port: numberOf(event.target.value, DEFAULT_SSH_PORT) })} />
-        </Field>
-        <Field label={t('field.user')} span={3}>
-          <Input className="box-border w-full" value={row.user} disabled={saving} onChange={event => onChange(draft.key, { user: event.target.value })} />
-        </Field>
-        <Field label={t('field.remotePort')} span={3}>
-          <Input className="box-border w-full" type="number" value={row.remotePort} disabled={saving} onChange={event => onChange(draft.key, { remotePort: numberOf(event.target.value, DEFAULT_REMOTE_PORT) })} />
-        </Field>
-        <Field label={t('field.profileName')} span={3}>
-          <Input className="box-border w-full" value={row.profileName ?? ''} placeholder="remote" disabled={saving || (row.startCommand ?? '') !== ''} onChange={event => onChange(draft.key, { profileName: event.target.value })} />
-        </Field>
-        <Field label={t('field.startCommand')} span={12}>
-          <Input className="box-border w-full" value={row.startCommand ?? ''} disabled={saving} onChange={event => onChange(draft.key, { startCommand: event.target.value })} />
-        </Field>
-      </div>
-      <div className="grid grid-cols-[repeat(12,minmax(0,1fr))] gap-[10px_12px] max-[760px]:grid-cols-[repeat(6,minmax(0,1fr))]">
-        <SecretField field="password" label={t('field.password')} keyName={draft.key} hasSecret={hasPassword} t={t} value={dirty.password ?? ''} onValue={onSecret} />
-        <SecretField field="passphrase" label={t('field.passphrase')} keyName={draft.key} hasSecret={hasPassphrase} t={t} value={dirty.passphrase ?? ''} onValue={onSecret} />
-      </div>
-      <AppearanceEditor row={row} t={t} onChange={onChange} draftKey={draft.key} />
-      <div className="flex items-center justify-end gap-[8px]">
-        {invalid ? <p className={cn('m-0 text-[12px] leading-[18px] text-tertiary', 'mr-auto')}>{t('saveHint')}</p> : null}
-        <Button variant="ghost" size="sm" disabled={saving} onClick={() => onCancel(draft.key)}>
-          {t('add.cancel')}
-        </Button>
-        <Button variant="primary" size="sm" disabled={saving || invalid} onClick={() => onSave(draft.key)}>
-          {t('save')}
-        </Button>
-      </div>
+      {row.transport === 'direct'
+        ? (
+            <div className="grid grid-cols-[repeat(12,minmax(0,1fr))] gap-[10px_12px] max-[760px]:grid-cols-[repeat(6,minmax(0,1fr))]">
+              <Field label={t('field.name')} span={6}>
+                <Input className="box-border w-full" value={row.name} disabled={saving} onChange={event => onChange(draft.key, { name: event.target.value })} />
+              </Field>
+              <Field label={t('field.directUrl')} span={6}>
+                <Input className="box-border w-full" value={row.directUrl ?? ''} disabled={saving} onChange={event => onChange(draft.key, { directUrl: event.target.value })} />
+              </Field>
+              <Field label={t('field.authMethod')} span={12}>
+                <div className="flex gap-[8px]">
+                  <Button variant={(row.directAuthMethod ?? 'password') === 'password' ? 'primary' : 'outline'} size="sm" onClick={() => onChange(draft.key, { directAuthMethod: 'password' })}>{t('auth.password')}</Button>
+                  <Button variant={row.directAuthMethod === 'token' ? 'primary' : 'outline'} size="sm" onClick={() => onChange(draft.key, { directAuthMethod: 'token' })}>{t('auth.token')}</Button>
+                </div>
+              </Field>
+              {row.directAuthMethod === 'token'
+                ? (
+                    <Field label={t('field.accessToken')} span={12}>
+                      <Input className="box-border w-full" type="password" value={dirty.accessToken ?? ''} placeholder={t('field.accessTokenHint')} disabled={saving} onChange={event => onSecret(draft.key, 'accessToken', event.target.value)} />
+                    </Field>
+                  )
+                : (
+                    <>
+                      <Field label={t('field.loginPassword')} span={6}>
+                        <Input className="box-border w-full" type="password" value={dirty.password ?? ''} placeholder={row.hasPassword ? t('secret.set') : t('field.loginPasswordHint')} disabled={saving} onChange={event => onSecret(draft.key, 'password', event.target.value)} />
+                      </Field>
+                      <Field label={t('field.loginUsername')} span={6}>
+                        <Input className="box-border w-full" value={row.loginUsername ?? ''} placeholder={t('field.optional')} disabled={saving} onChange={event => onChange(draft.key, { loginUsername: event.target.value })} />
+                      </Field>
+                      <Field label={t('field.loginPath')} span={12}>
+                        <Input className="box-border w-full" value={row.loginPath ?? '/__login'} disabled={saving} onChange={event => onChange(draft.key, { loginPath: event.target.value })} />
+                      </Field>
+                    </>
+                  )}
+              <AppearanceEditor row={row} t={t} onChange={onChange} draftKey={draft.key} />
+              <div className="col-span-full flex items-center justify-end gap-[8px]">
+                <Button variant="ghost" size="sm" disabled={saving} onClick={() => onCancel(draft.key)}>{t('add.cancel')}</Button>
+                <Button variant="primary" size="sm" disabled={saving || row.name === '' || row.directUrl === ''} onClick={() => onSave(draft.key)}>{t('save')}</Button>
+              </div>
+            </div>
+          )
+        : (
+            <>
+              <div className="grid grid-cols-[repeat(12,minmax(0,1fr))] gap-[10px_12px] max-[760px]:grid-cols-[repeat(6,minmax(0,1fr))]">
+                <Field label={t('field.id')} span={3}>
+                  <Input className="box-border w-full" value={row.id} disabled />
+                </Field>
+                <Field label={t('field.name')} span={4}>
+                  <Input className="box-border w-full" value={row.name} disabled={saving} onChange={event => onChange(draft.key, { name: event.target.value })} />
+                </Field>
+                <Field label={t('field.host')} span={5}>
+                  <Input className="box-border w-full" value={row.host} disabled={saving} onChange={event => onChange(draft.key, { host: event.target.value })} />
+                </Field>
+                <Field label={t('field.port')} span={3}>
+                  <Input className="box-border w-full" type="number" value={row.port} disabled={saving} onChange={event => onChange(draft.key, { port: numberOf(event.target.value, DEFAULT_SSH_PORT) })} />
+                </Field>
+                <Field label={t('field.user')} span={3}>
+                  <Input className="box-border w-full" value={row.user} disabled={saving} onChange={event => onChange(draft.key, { user: event.target.value })} />
+                </Field>
+                <Field label={t('field.remotePort')} span={3}>
+                  <Input className="box-border w-full" type="number" value={row.remotePort} disabled={saving} onChange={event => onChange(draft.key, { remotePort: numberOf(event.target.value, DEFAULT_REMOTE_PORT) })} />
+                </Field>
+                <Field label={t('field.profileName')} span={3}>
+                  <Input className="box-border w-full" value={row.profileName ?? ''} placeholder="remote" disabled={saving || (row.startCommand ?? '') !== ''} onChange={event => onChange(draft.key, { profileName: event.target.value })} />
+                </Field>
+                <Field label={t('field.startCommand')} span={12}>
+                  <Input className="box-border w-full" value={row.startCommand ?? ''} disabled={saving} onChange={event => onChange(draft.key, { startCommand: event.target.value })} />
+                </Field>
+              </div>
+              <div className="grid grid-cols-[repeat(12,minmax(0,1fr))] gap-[10px_12px] max-[760px]:grid-cols-[repeat(6,minmax(0,1fr))]">
+                <SecretField field="password" label={t('field.password')} keyName={draft.key} hasSecret={hasPassword} t={t} value={dirty.password ?? ''} onValue={onSecret} />
+                <SecretField field="passphrase" label={t('field.passphrase')} keyName={draft.key} hasSecret={hasPassphrase} t={t} value={dirty.passphrase ?? ''} onValue={onSecret} />
+              </div>
+              <AppearanceEditor row={row} t={t} onChange={onChange} draftKey={draft.key} />
+              <div className="flex items-center justify-end gap-[8px]">
+                {invalid ? <p className={cn('m-0 text-[12px] leading-[18px] text-tertiary', 'mr-auto')}>{t('saveHint')}</p> : null}
+                <Button variant="ghost" size="sm" disabled={saving} onClick={() => onCancel(draft.key)}>
+                  {t('add.cancel')}
+                </Button>
+                <Button variant="primary" size="sm" disabled={saving || invalid} onClick={() => onSave(draft.key)}>
+                  {t('save')}
+                </Button>
+              </div>
+            </>
+          )}
     </div>
   )
 }
 
-function RowActions({ id, t, status, busy, bridgeOpen, bridgePending, opening, onTest, onConnect, onDisconnect, onOpen, extras }: {
+function RowActions({ id, t, status, busy, bridgeOpen, bridgePending, opening, onTest, onConnect, onDisconnect, onOpen, extras, direct = false }: {
   id: string
   t: (key: RemoteKey) => string
+  direct?: boolean
   status: MachineStatus | undefined
   busy: 'test' | 'connect' | 'disconnect' | 'install' | undefined
   bridgeOpen: boolean
@@ -181,7 +227,7 @@ function RowActions({ id, t, status, busy, bridgeOpen, bridgePending, opening, o
   const held = status?.state === 'connecting' || status?.state === 'testing' || status?.state === 'reconnecting'
   return (
     <>
-      <Button variant="outline" size="sm" disabled={busy !== undefined || held} onClick={() => onTest(id)}>
+      <Button variant="outline" size="sm" disabled={direct || busy !== undefined || held} onClick={() => onTest(id)}>
         {t('test')}
       </Button>
       {connected
@@ -472,7 +518,7 @@ function AddMachineDialog({ t, saving, takenIds, onSubmit, onClose }: {
   t: (key: RemoteKey) => string
   saving: boolean
   takenIds: ReadonlySet<string>
-  onSubmit: (row: MachineRow) => void
+  onSubmit: (row: MachineRow, secrets: SecretValues) => void
   onClose: () => void
 }): ReactNode {
   const [host, setHost] = useState('')
@@ -483,18 +529,37 @@ function AddMachineDialog({ t, saving, takenIds, onSubmit, onClose }: {
   const [user, setUser] = useState('')
   const [remotePort, setRemotePort] = useState(String(DEFAULT_REMOTE_PORT))
   const [profileName, setProfileName] = useState('')
+  const [transport, setTransport] = useState<'ssh' | 'direct'>('ssh')
+  const [directUrl, setDirectUrl] = useState('')
+  const [accessToken, setAccessToken] = useState('')
+  const [authMethod, setAuthMethod] = useState<'password' | 'token'>('password')
+  const [loginPassword, setLoginPassword] = useState('')
+  const [loginUsername, setLoginUsername] = useState('')
+  const [loginPath, setLoginPath] = useState('/__login')
 
-  const slug = slugOf(host)
+  const slug = slugOf(transport === 'direct' && URL.canParse(directUrl) ? new URL(directUrl).host : host)
   const effectiveId = idTouched ? id.trim() : (slug === '' ? '' : freeIdOf(slug, takenIds))
-  const trimmedHost = host.trim()
+  const trimmedHost = transport === 'direct' ? directUrl.trim() : host.trim()
+  let directValid = true
+  if (transport === 'direct') {
+    try {
+      const url = new URL(trimmedHost)
+      directValid = ['http:', 'https:'].includes(url.protocol) && url.origin === trimmedHost.replace(/\/$/u, '')
+    }
+    catch {
+      directValid = false
+    }
+  }
   const errorKey: RemoteKey | null
     = trimmedHost === ''
       ? 'add.host_required'
-      : !ID_PATTERN.test(effectiveId)
-          ? 'add.id_invalid'
-          : takenIds.has(effectiveId)
-            ? 'add.id_taken'
-            : null
+      : !directValid
+          ? 'add.url_invalid'
+          : !ID_PATTERN.test(effectiveId)
+              ? 'add.id_invalid'
+              : takenIds.has(effectiveId)
+                ? 'add.id_taken'
+                : null
 
   function submit(): void {
     if (errorKey !== null || saving)
@@ -502,14 +567,19 @@ function AddMachineDialog({ t, saving, takenIds, onSubmit, onClose }: {
     onSubmit({
       id: effectiveId,
       name: name.trim() === '' ? effectiveId : name.trim(),
-      host: trimmedHost,
+      host: transport === 'direct' ? new URL(trimmedHost).hostname : trimmedHost,
       port: numberOf(port, DEFAULT_SSH_PORT),
+      ...(transport === 'direct' ? { transport: 'direct' as const, directUrl: new URL(trimmedHost).origin, directAuthMethod: authMethod, loginUsername, loginPath, hasAccessToken: authMethod === 'token' && accessToken.trim() !== '' } : {}),
       user: user.trim(),
-      hasPassword: false,
+      hasPassword: transport === 'direct' && authMethod === 'password' && loginPassword !== '',
       hasPassphrase: false,
       remotePort: numberOf(remotePort, DEFAULT_REMOTE_PORT),
       ...(profileName.trim() === '' ? {} : { profileName: profileName.trim() }),
-    })
+    }, transport === 'direct'
+      ? authMethod === 'token'
+        ? accessToken.trim() !== '' ? { accessToken: accessToken.trim() } : {}
+        : loginPassword !== '' ? { password: loginPassword } : {}
+      : {})
   }
 
   return (
@@ -526,22 +596,76 @@ function AddMachineDialog({ t, saving, takenIds, onSubmit, onClose }: {
       )}
     >
       <div className="grid grid-cols-[repeat(12,minmax(0,1fr))] gap-[10px_12px] max-[760px]:grid-cols-[repeat(6,minmax(0,1fr))]">
-        <Field label={t('field.host')} span={8}>
-          <Input
-            className="box-border w-full"
-            value={host}
-            autoFocus
-            disabled={saving}
-            onChange={event => setHost(event.target.value)}
-          />
+        <Field label={t('field.transport')} span={12}>
+          <div className="flex gap-[8px]">
+            <Button variant={transport === 'ssh' ? 'primary' : 'outline'} size="sm" onClick={() => setTransport('ssh')}>{t('transport.ssh')}</Button>
+            <Button variant={transport === 'direct' ? 'primary' : 'outline'} size="sm" onClick={() => setTransport('direct')}>{t('transport.direct')}</Button>
+          </div>
         </Field>
-        <Field label={t('field.port')} span={4}>
-          <Input className="box-border w-full" value={port} disabled={saving} onChange={event => setPort(event.target.value)} />
-        </Field>
-        <Field label={t('field.name')} span={4}>
+        {transport === 'direct'
+          ? (
+              <>
+                <Field label={t('field.directUrl')} span={12}>
+                  <Input className="box-border w-full" value={directUrl} placeholder="https://dsh.example.com/" autoFocus disabled={saving} onChange={event => setDirectUrl(event.target.value)} />
+                </Field>
+                <Field label={t('field.authMethod')} span={12}>
+                  <div className="flex gap-[8px]">
+                    <Button variant={authMethod === 'password' ? 'primary' : 'outline'} size="sm" onClick={() => setAuthMethod('password')}>{t('auth.password')}</Button>
+                    <Button variant={authMethod === 'token' ? 'primary' : 'outline'} size="sm" onClick={() => setAuthMethod('token')}>{t('auth.token')}</Button>
+                  </div>
+                </Field>
+                {authMethod === 'token'
+                  ? (
+                      <Field label={t('field.accessToken')} span={12}>
+                        <Input className="box-border w-full" type="password" value={accessToken} placeholder={t('field.accessTokenHint')} disabled={saving} onChange={event => setAccessToken(event.target.value)} />
+                      </Field>
+                    )
+                  : (
+                      <>
+                        <Field label={t('field.loginPassword')} span={6}>
+                          <Input className="box-border w-full" type="password" value={loginPassword} placeholder={t('field.loginPasswordHint')} disabled={saving} onChange={event => setLoginPassword(event.target.value)} />
+                        </Field>
+                        <Field label={t('field.loginUsername')} span={6}>
+                          <Input className="box-border w-full" value={loginUsername} placeholder={t('field.optional')} disabled={saving} onChange={event => setLoginUsername(event.target.value)} />
+                        </Field>
+                        <Field label={t('field.loginPath')} span={12}>
+                          <Input className="box-border w-full" value={loginPath} disabled={saving} onChange={event => setLoginPath(event.target.value)} />
+                        </Field>
+                      </>
+                    )}
+              </>
+            )
+          : (
+              <>
+                <Field label={t('field.host')} span={8}>
+                  <Input
+                    className="box-border w-full"
+                    value={host}
+                    autoFocus
+                    disabled={saving}
+                    onChange={event => setHost(event.target.value)}
+                  />
+                </Field>
+                <Field label={t('field.port')} span={4}>
+                  <Input className="box-border w-full" value={port} disabled={saving} onChange={event => setPort(event.target.value)} />
+                </Field>
+                <Field label={t('field.user')} span={4}>
+                  <Input className="box-border w-full" value={user} disabled={saving} onChange={event => setUser(event.target.value)} />
+                </Field>
+                <Field label={t('field.remotePort')} span={6}>
+                  <Input className="box-border w-full" value={remotePort} disabled={saving} onChange={event => setRemotePort(event.target.value)} />
+                </Field>
+                <Field label={t('field.profileName')} span={6}>
+                  <Input className="box-border w-full" value={profileName} placeholder="remote" disabled={saving} onChange={event => setProfileName(event.target.value)} />
+                </Field>
+              </>
+            )}
+      </div>
+      <div className="mt-[10px] grid grid-cols-[repeat(12,minmax(0,1fr))] gap-[10px_12px] max-[760px]:grid-cols-[repeat(6,minmax(0,1fr))]">
+        <Field label={t('field.name')} span={6}>
           <Input className="box-border w-full" value={name} disabled={saving} onChange={event => setName(event.target.value)} />
         </Field>
-        <Field label={t('field.id')} span={4}>
+        <Field label={t('field.id')} span={6}>
           <Input
             className="box-border w-full"
             value={idTouched ? id : effectiveId}
@@ -552,15 +676,6 @@ function AddMachineDialog({ t, saving, takenIds, onSubmit, onClose }: {
               setId(event.target.value)
             }}
           />
-        </Field>
-        <Field label={t('field.user')} span={4}>
-          <Input className="box-border w-full" value={user} disabled={saving} onChange={event => setUser(event.target.value)} />
-        </Field>
-        <Field label={t('field.remotePort')} span={6}>
-          <Input className="box-border w-full" value={remotePort} disabled={saving} onChange={event => setRemotePort(event.target.value)} />
-        </Field>
-        <Field label={t('field.profileName')} span={6}>
-          <Input className="box-border w-full" value={profileName} placeholder="remote" disabled={saving} onChange={event => setProfileName(event.target.value)} />
         </Field>
       </div>
       {errorKey === null
@@ -651,9 +766,9 @@ export function MachinesSection({ t, bridge = desktopBridge }: MachinesSectionPr
     setEditingId(null)
   }
 
-  const submitAdd = async (row: MachineRow): Promise<void> => {
+  const submitAdd = async (row: MachineRow, secrets: SecretValues): Promise<void> => {
     setAddSaving(true)
-    const result = await service.persist({ machines: [...store.machines.machines, row], secrets: {} })
+    const result = await service.persist({ machines: [...store.machines.machines, row], secrets: { [row.id]: secrets } })
     setAddSaving(false)
     if (!result.ok)
       return
@@ -807,7 +922,7 @@ export function MachinesSection({ t, bridge = desktopBridge }: MachinesSectionPr
                 key={row.id}
                 id={row.id}
                 name={row.name === '' ? row.id : row.name}
-                tag={row.host}
+                tag={row.transport === 'direct' ? 'URL' : row.host}
                 tintColor={colorOf(row)}
                 tintBorder={row.tintBorder === true}
                 status={state.statuses[row.id]}
@@ -817,6 +932,7 @@ export function MachinesSection({ t, bridge = desktopBridge }: MachinesSectionPr
                   <RowActions
                     id={row.id}
                     t={t}
+                    direct={row.transport === 'direct'}
                     status={state.statuses[row.id]}
                     busy={state.busy[row.id]}
                     bridgeOpen={bridgeOpen}
@@ -927,7 +1043,7 @@ export function MachinesSection({ t, bridge = desktopBridge }: MachinesSectionPr
               t={t}
               saving={addSaving}
               takenIds={new Set(state.machines.map(row => row.id))}
-              onSubmit={row => void submitAdd(row)}
+              onSubmit={(row, secrets) => void submitAdd(row, secrets)}
               onClose={() => {
                 if (!addSaving)
                   setAddOpen(false)

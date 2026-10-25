@@ -204,7 +204,7 @@ function ShortcutLabel({ label, hint }: { label: string, hint?: string }) {
 }
 
 export interface NavbarProps {
-  onRemoteChange: (url: string, tint: string | null) => void
+  onRemoteChange: (url: string, tint: string | null, hostId: string | null) => void
   /** iframe 回报的 dsh 侧边栏折叠状态（导航桥逻辑在 `iframe.tsx`） */
   sidebarCollapsed?: boolean
   /** 切换 iframe 内 dsh 侧边栏（向 iframe 发 `dsh://sidebar:toggle`）；传入时启用左侧导航控制 */

@@ -13,8 +13,15 @@ export interface RemoteMachineListItem {
   startCommand?: string
   color?: string
   tintBorder?: boolean
+  transport?: 'ssh' | 'direct'
+  directUrl?: string
+  hasAccessToken?: boolean
+  directAuthMethod?: 'password' | 'token'
+  loginUsername?: string
+  loginPath?: string
   state?: RemoteConnectionState
   tunnelBaseUrl?: string
+  cacheIdentity?: string
   lastError?: string
   dshMissing?: boolean
   progress?: RemoteProgress
@@ -55,11 +62,17 @@ export interface RemoteMachineRowBody {
   startCommand?: string
   color?: string
   tintBorder?: boolean
+  transport?: 'ssh' | 'direct'
+  directUrl?: string
+  directAuthMethod?: 'password' | 'token'
+  loginUsername?: string
+  loginPath?: string
 }
 
 export interface RemoteMachineSecretsBody {
   password?: string
   passphrase?: string
+  accessToken?: string
 }
 
 export interface RemoteMachineSaveBody {
