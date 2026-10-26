@@ -70,7 +70,7 @@ pnpm exec vitest run --project unit \
   packages/dsh-tauri-remote/src/host/service/machine.test.ts \
   packages/dsh-tauri-remote/src/client/components/machines-section.test.tsx \
   packages/dsh-tauri-remote/src/client/apis/parsers.test.ts src/hooks/use-remote.test.ts
-# 2026-10-26 最终实测：11 files / 481 tests 全部通过
+# 2026-10-26 最终实测：13 files / 501 tests 全部通过
 ```
 
 ## 4. 其它未完成 / 待办
@@ -82,7 +82,7 @@ pnpm exec vitest run --project unit \
 ## 5. 本次测试实况（2026-10-25）
 
 - `pnpm typecheck` ✅；`pnpm build` ✅（前端 12.92s；`dsh-tauri-remote` 构建通过）。
-- P3 相关 Vitest **481/481**（11 files，含 P3c 预加载 4 条）；切换/保活/布局 **46/46**；Rust `desktop::` **73/73**。
+- P3 相关 Vitest **501/501**（13 files，含 P3c 预加载 4 条）；切换/保活/布局 **46/46**；Rust `desktop::` **73/73**。
 - 变更 TypeScript 文件 eslint 无输出；变更 Rust 文件 clippy 无告警（`service/workflow/process.rs` 的上游 unused import 不计入本功能）。
 - 历史全量（早于最后 3 处修复）Rust **1225 passed / 1 failed / 1 ignored**：仅 `config::proxy::tests::test_treats_an_empty_proxy_as_a_direct_connection`，外部探测返回 502，单跑同样失败，与本功能无关。
 - 全量前端 **5408 passed / 18 failed / 5 skipped**：本会话引入的 3 条 mock 污染已修复；其余 15 条为 Windows symlink 权限/既有测试（`bootstrap`、`migrate`、`plugins-sync`、`scroll-follow-patch`），不可写成全量全绿。

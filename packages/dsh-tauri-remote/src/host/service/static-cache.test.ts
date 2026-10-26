@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -105,6 +105,34 @@ describe('authenticated response tee', () => {
     expect(await readFile(join(root, 'lan-host', lanScope, key), 'utf8')).toBe('lan')
     expect(await readFile(join(root, 'https-host', httpsScope, key), 'utf8')).toBe('https')
     expect(await readdir(root)).toHaveLength(2)
+  })
+
+  it('drops older content of the same path after a new bundle lands', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-static-cache-'))
+    tempRoots.push(root)
+    const scope = createHash('sha256').update('http://192.168.31.83:3080').digest('hex').slice(0, 16)
+    const key = createHash('sha256').update('/manifest.webmanifest').digest('hex')
+    const directory = join(root, 'lan-host', scope)
+    await mkdir(directory, { recursive: true })
+    const oldBody = Buffer.alloc(10, 'a')
+    const newBody = Buffer.alloc(10, 'b')
+    const oldKey = 'f'.repeat(64)
+    await writeFile(join(directory, oldKey), oldBody)
+    await writeFile(join(directory, `${oldKey}.meta`), JSON.stringify({ path: '/manifest.webmanifest', fetchedAt: 1, contentType: 'application/manifest+json', bytes: 10, contentHash: createHash('sha256').update(oldBody).digest('hex') }), 'utf8')
+    const { PassThrough } = await import('node:stream')
+    const upstream = new PassThrough()
+    let close: (() => void) | undefined
+    const response = new (class {
+      once(_event: string, listener: () => void): void { close = listener }
+      off(_event: string, _listener: () => void): void {}
+    })() as unknown as ServerResponse
+    cacheBody(root, 'lan-host', 'http://192.168.31.83:3080', '/manifest.webmanifest', upstream as unknown as IncomingMessage, response, {})
+    upstream.end(newBody)
+    await sleep(150)
+    close?.()
+    await sleep(150)
+    await expect(readFile(join(directory, key), 'utf8')).resolves.toBe(newBody.toString())
+    await expect(readFile(join(directory, oldKey), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('drops an interrupted response instead of caching a partial bundle', async () => {

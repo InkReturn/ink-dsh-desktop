@@ -28,7 +28,7 @@
 
 ## 缓存与认证边界
 
-- gateway 只在已鉴权、允许缓存的静态响应上写盘；HTML、登录页、API、`Set-Cookie`、`private/no-store`、压缩未解码响应不进入缓存。
+- gateway 只在已鉴权、允许缓存的静态响应上写盘；HTML、登录页、API、`Set-Cookie`、`private/no-store`、压缩未解码响应不进入缓存。同路径内容变化后，旧 hash 副本会在下一次落盘时清掉，不长期堆积。
 - 目录：`<base>/inkdsh/remote-cache/<hostId>/<sha256(上游身份)前16位>/<sha256(path)>`。
 - 已确认 LAN 与 Inkmo 各自缓存目录均有真实 bundle；改 Host 地址不会命中旧 origin 的缓存。
 - 密码、访问令牌不出现在 iframe URL、缓存文件或 meta；日志不回显凭据。
@@ -50,7 +50,7 @@
 
 - 真实 core connection + `dsh-web-login`：密码登录 303，gateway 页面 200，静态资源 200。
 - Host 状态机 / 切换器 / 保活 WebView 相关测试 **46/46**。
-- P3 登录/网关/缓存/预加载/界面相关回归 **481/481**（11 files，含真实 HTTP 登录、缓存写盘与预加载暂停）。
+- P3 登录/网关/缓存/预加载/界面相关回归 **501/501**（13 files，含真实 HTTP 登录、缓存写盘与预加载暂停）。
 - Rust `desktop::` **73/73**（含原生缓存读侧 5 条、远端绑定生命周期 1 条）；`pnpm typecheck`、变更文件 eslint、`pnpm build` 通过。
 
 ## 尚未完成

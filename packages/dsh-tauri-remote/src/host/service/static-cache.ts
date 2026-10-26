@@ -14,6 +14,7 @@ interface CacheFile {
   hostId: string
   bytes: number
   modified: number
+  staleByContent: boolean
 }
 
 export function cachePathOf(url: string): string | undefined {
@@ -31,6 +32,25 @@ export function cachePathOf(url: string): string | undefined {
     // 非法 URL 一律不缓存。
   }
   return undefined
+}
+
+/** 已完整落盘的响应仍写盘；顺带做一次同 Host 路径版本去重，保留最新内容。 */
+async function pruneStalePathVersions(root: string, hostId: string, identitySource: string, currentPath: string, currentHash: string): Promise<void> {
+  if (root === undefined || !/^[a-z0-9][a-z0-9-]*$/u.test(hostId) || identitySource === '')
+    return
+  const identity = createHash('sha256').update(identitySource).digest('hex').slice(0, 16)
+  const scope = join(root, hostId, identity)
+  for (const file of await readdir(scope).catch(() => [])) {
+    if (!/^[a-f0-9]{64}$/u.test(file))
+      continue
+    const path = join(scope, file)
+    const meta = await readFile(`${path}.meta`, 'utf8')
+      .then(text => JSON.parse(text) as { path?: string, contentHash?: string, fetchedAt?: number })
+      .catch(() => undefined)
+    if (meta?.path !== currentPath || meta.contentHash === currentHash)
+      continue
+    await Promise.all([rm(path, { force: true }), rm(`${path}.meta`, { force: true })]).catch(() => undefined)
+  }
 }
 
 function cacheFile(root: string, hostId: string, identitySource: string, key: string): string | undefined {
@@ -54,6 +74,18 @@ export async function cachedAssetExists(root: string | undefined, hostId: string
   catch {
     return false
   }
+}
+
+/** 写侧把响应内容 sha256 记进 meta，用于同一路径不同版本的 LRU 保护。 */
+function contentHashOf(chunks: Buffer[]): string {
+  const hash = createHash('sha256')
+  for (const chunk of chunks)
+    hash.update(chunk)
+  return hash.digest('hex')
+}
+
+async function writeMeta(file: string, path: string, contentType: string, bytes: number, contentHash: string): Promise<void> {
+  await writeFile(`${file}.meta`, `${JSON.stringify({ path, fetchedAt: Date.now(), contentType, bytes, contentHash })}\n`, 'utf8')
 }
 
 /** HTML、401、Set-Cookie、私有/可协商响应都不能进入静态缓存。 */
@@ -113,10 +145,13 @@ export function cacheBody(root: string | undefined, hostId: string, identitySour
       return
     try {
       await mkdir(scopedDirectory, { recursive: true })
-      await writeFile(temporary, Buffer.concat(chunks, bytes), { flag: 'wx' })
-      await writeFile(`${temporary}.meta`, `${JSON.stringify({ path, fetchedAt: Date.now(), contentType: String(headers['content-type'] ?? 'application/octet-stream'), bytes })}\n`, 'utf8')
+      const body = Buffer.concat(chunks, bytes)
+      const contentHash = contentHashOf(chunks)
+      await writeFile(temporary, body, { flag: 'wx' })
+      await writeMeta(temporary, path, String(headers['content-type'] ?? 'application/octet-stream'), bytes, contentHash)
       await rename(temporary, final)
       await rename(`${temporary}.meta`, `${final}.meta`)
+      await pruneStalePathVersions(cacheRoot, hostId, identitySource, path, contentHash)
       await evict(cacheRoot, hostId)
     }
     catch {
@@ -133,8 +168,15 @@ export function cacheBody(root: string | undefined, hostId: string, identitySour
   response.once('close', onClose)
 }
 
+interface HostMetaFile {
+  path: string
+  contentType: string
+  contentHash?: string
+}
+
 async function evict(root: string, currentHost: string): Promise<void> {
   const files: CacheFile[] = []
+  const latestByPath = new Map<string, { modified: number, contentHash: string }>()
   for (const entry of await readdir(root, { withFileTypes: true }).catch(() => [])) {
     if (!entry.isDirectory() || !/^[a-z0-9][a-z0-9-]*$/u.test(entry.name))
       continue
@@ -146,14 +188,31 @@ async function evict(root: string, currentHost: string): Promise<void> {
           continue
         const path = join(root, entry.name, scope.name, file)
         const info = await stat(path).catch(() => undefined)
-        if (info?.isFile())
-          files.push({ path, hostId: entry.name, bytes: info.size, modified: info.mtimeMs })
+        if (!info?.isFile())
+          continue
+        const meta = await readFile(`${path}.meta`, 'utf8')
+          .then(text => JSON.parse(text) as HostMetaFile)
+          .catch(() => undefined)
+        const cachePath = meta?.path ?? file
+        let staleByContent = false
+        if (meta?.contentHash !== undefined) {
+          const latest = latestByPath.get(cachePath)
+          if (latest === undefined || info.mtimeMs >= latest.modified) {
+            if (latest !== undefined && info.mtimeMs === latest.modified)
+              staleByContent = latest.contentHash !== meta.contentHash
+            latestByPath.set(cachePath, { modified: info.mtimeMs, contentHash: meta.contentHash })
+          }
+          else {
+            staleByContent = latest.contentHash !== meta.contentHash
+          }
+        }
+        files.push({ path, hostId: entry.name, bytes: info.size, modified: info.mtimeMs, staleByContent })
       }
     }
   }
   let total = files.reduce((sum, file) => sum + file.bytes, 0)
   let hostTotal = files.filter(file => file.hostId === currentHost).reduce((sum, file) => sum + file.bytes, 0)
-  files.sort((left, right) => Number(left.hostId === currentHost) - Number(right.hostId === currentHost) || left.modified - right.modified)
+  files.sort((left, right) => Number(left.staleByContent) - Number(right.staleByContent) || Number(left.hostId === currentHost) - Number(right.hostId === currentHost) || left.modified - right.modified)
   for (const file of files) {
     if (total <= GLOBAL_LIMIT_BYTES && hostTotal <= HOST_LIMIT_BYTES)
       break
